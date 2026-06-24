@@ -1,0 +1,18 @@
+# XcodeGen-generated project — regenerated on every CI run
+*.xcodeproj
+*.xcworkspace
+
+# Build artifacts
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+
+# Swift / Xcode
+.swiftpm/
+*.swp
+.DS_Store
+
+# User-specific
+xcuserdata/
+*.xcuserstate
