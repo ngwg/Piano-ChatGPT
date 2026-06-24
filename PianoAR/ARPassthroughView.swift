@@ -73,8 +73,8 @@ struct ARPassthroughView: UIViewRepresentable {
             else { return }
 
             // Lazy-create the finger node pool once the scene is ready
-            if fingerNodes.isEmpty {
-                fingerNodes = (0..<10).map { _ in makeFingerNode(in: renderer.scene) }
+            if fingerNodes.isEmpty, let scene = sceneView.scene {
+                fingerNodes = (0..<10).map { _ in makeFingerNode(in: scene) }
             }
 
             // Drive Vision at ~20 fps
