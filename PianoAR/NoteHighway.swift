@@ -207,9 +207,10 @@ final class NoteHighway {
     private func buildLabelPool() {
         for _ in 0..<Self.poolSize {
             let node = SCNNode()
-            // Facing up (same orientation as key labels on the keyboard surface).
+            // After eulerAngles.x = -π/2: text face → +Y (faces camera which looks down),
+            // character height extends in world -Z (into the highway, away from playhead).
             node.eulerAngles    = SCNVector3(-Float.pi / 2, 0, 0)
-            node.scale          = SCNVector3(0.009, 0.009, 0.009)
+            node.scale          = SCNVector3(0.012, 0.012, 0.012)
             node.renderingOrder = 60
             node.isHidden       = true
             rootNode.addChildNode(node)
@@ -324,12 +325,13 @@ final class NoteHighway {
                 lbl.geometry   = txt
                 barNoteKeys[barIdx] = note.key
             }
-            // Center text on the bar: after -π/2 X rotation, text "height" extends
-            // in -Z, so placing at nearZ centers the text near the leading edge.
+            // Place text at bar center; X offset approximates centering by char count.
+            // At scale 0.012 + fontSize 1.0, each char is ~0.0066 m wide.
+            let charOffset = Float(note.key.count) * 0.0033
             lbl.simdPosition = SIMD3<Float>(
-                leftEdge + key.xCenter - 0.005,
-                Self.highwayY + Self.barThickness + 0.002,
-                nearZ - 0.002
+                leftEdge + key.xCenter - charOffset,
+                Self.highwayY + Self.barThickness + 0.003,
+                centerZ
             )
             lbl.isHidden = false
 
