@@ -2,13 +2,6 @@ import SwiftUI
 import ARKit
 import SceneKit
 
-// Simple transfer type: pre-projected 2D segments ready to draw.
-struct HandOverlayHand {
-    let isLeft: Bool
-    let segments: [(CGPoint, CGPoint)]
-    let isPalmSegment: [Bool]   // parallel to segments — wider stroke for palm bones
-}
-
 struct ARPassthroughView: UIViewRepresentable {
     let session:     ARSessionModel
     let placement:   PlacementManager
@@ -34,21 +27,6 @@ struct ARPassthroughView: UIViewRepresentable {
         placement.sceneView   = view
         calibration.sceneView = view
 
-        // 2-D hand silhouette overlay sits on top of the AR scene.
-        let overlay = HandOverlayView(frame: .zero)
-        overlay.translatesAutoresizingMaskIntoConstraints = false
-        overlay.isOpaque                  = false
-        overlay.backgroundColor           = .clear
-        overlay.isUserInteractionEnabled  = false
-        view.addSubview(overlay)
-        NSLayoutConstraint.activate([
-            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            overlay.topAnchor.constraint(equalTo: view.topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
-        context.coordinator.handOverlay = overlay
-
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
         view.addGestureRecognizer(tap)
@@ -68,11 +46,8 @@ struct ARPassthroughView: UIViewRepresentable {
         let calibration: CalibrationManager
         let handTracker: HandTracker
         var onTap: (CGPoint) -> Void
-        weak var handOverlay: HandOverlayView?
 
-        // Indices into boneConnections that connect wrist→MCP or cross the palm knuckles.
-        // These get a wider stroke for a filled-palm look.
-        private static let palmBoneIndices: Set<Int> = [4, 8, 12, 16, 20, 21, 22]
+        private var hand3D: Hand3DOverlay?
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, onTap: @escaping (CGPoint) -> Void) {
@@ -87,50 +62,20 @@ struct ARPassthroughView: UIViewRepresentable {
             onTap(g.location(in: v))
         }
 
-        // MARK: Per-frame update
+        // MARK: Per-frame update — runs on the SceneKit render thread at 60 fps.
+        // Updating SCNNode positions here means zero async-dispatch lag:
+        // the nodes are repositioned and rendered in the same frame.
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
             guard let sceneView = renderer as? ARSCNView,
-                  let frame    = sceneView.session.currentFrame
-            else { return }
+                  let frame    = sceneView.session.currentFrame else { return }
+
+            if hand3D == nil {
+                hand3D = Hand3DOverlay(scene: sceneView.scene)
+            }
 
             handTracker.maybeProcess(frame)
-
-            // Project each 3D world joint to 2D screen coords using SceneKit's own
-            // camera transform — the same one used to render everything else, so the
-            // overlay will be pixel-perfect regardless of coordinate space quirks.
-            let hands = handTracker.snapshot()
-            var overlayHands: [HandOverlayHand] = []
-
-            for hand in hands {
-                var segs:   [(CGPoint, CGPoint)] = []
-                var palms:  [Bool]               = []
-
-                for (idx, (fi, ti)) in HandTracker.boneConnections.enumerated() {
-                    guard let a = hand.joints[HandTracker.allJoints[fi]],
-                          let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
-
-                    let pa = sceneView.projectPoint(SCNVector3(a.x, a.y, a.z))
-                    let pb = sceneView.projectPoint(SCNVector3(b.x, b.y, b.z))
-
-                    // z in SceneKit projectPoint is NDC [0,1]; outside = behind camera.
-                    guard pa.z > 0, pa.z < 1, pb.z > 0, pb.z < 1 else { continue }
-
-                    segs.append((CGPoint(x: Double(pa.x), y: Double(pa.y)),
-                                 CGPoint(x: Double(pb.x), y: Double(pb.y))))
-                    palms.append(Self.palmBoneIndices.contains(idx))
-                }
-
-                if !segs.isEmpty {
-                    overlayHands.append(HandOverlayHand(isLeft: hand.isLeft,
-                                                        segments: segs,
-                                                        isPalmSegment: palms))
-                }
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                self?.handOverlay?.update(overlayHands)
-            }
+            hand3D?.update(hands: handTracker.snapshot())
         }
 
         // MARK: Anchor → node
@@ -138,16 +83,16 @@ struct ARPassthroughView: UIViewRepresentable {
         func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
             if anchor.name == "keyboard" { return KeyboardNode.make() }
             if anchor.name == "keyboard_calibrated" {
-                let node = KeyboardNode.make()
+                let n = KeyboardNode.make()
                 if let d = calibration.calibrationData {
-                    node.scale = SCNVector3(d.widthScale, 1, d.depthScale)
+                    n.scale = SCNVector3(d.widthScale, 1, d.depthScale)
                 }
-                return node
+                return n
             }
-            if let name = anchor.name, name.hasPrefix("corner_") { return makeCornerMarker() }
+            if let name = anchor.name, name.hasPrefix("corner_") { return cornerMarker() }
             if let plane = anchor as? ARPlaneAnchor {
                 placement.onPlaneAdded()
-                return makePlaneNode(for: plane)
+                return planeNode(for: plane)
             }
             return nil
         }
@@ -155,95 +100,136 @@ struct ARPassthroughView: UIViewRepresentable {
         func renderer(_ renderer: SCNSceneRenderer,
                       didUpdate node: SCNNode, for anchor: ARAnchor) {
             guard let plane = anchor as? ARPlaneAnchor else { return }
-            updatePlaneNode(node, for: plane)
+            updatePlane(node, for: plane)
         }
 
-        // MARK: Small helpers
-
-        private func makeCornerMarker() -> SCNNode {
-            let s = SCNSphere(radius: 0.012)
-            let m = SCNMaterial()
-            m.diffuse.contents  = UIColor.orange
-            m.emission.contents = UIColor.orange.withAlphaComponent(0.6)
-            s.materials = [m]
-            return SCNNode(geometry: s)
+        private func cornerMarker() -> SCNNode {
+            let s = SCNSphere(radius: 0.012); let m = SCNMaterial()
+            m.diffuse.contents = UIColor.orange; m.emission.contents = UIColor.orange.withAlphaComponent(0.6)
+            s.materials = [m]; return SCNNode(geometry: s)
         }
 
-        private func makePlaneNode(for anchor: ARPlaneAnchor) -> SCNNode {
+        private func planeNode(for a: ARPlaneAnchor) -> SCNNode {
             let root = SCNNode()
-            let geo  = SCNPlane(width: CGFloat(anchor.planeExtent.width),
-                                height: CGFloat(anchor.planeExtent.height))
-            let mat  = SCNMaterial()
-            mat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.22)
-            mat.isDoubleSided    = true
-            geo.materials        = [mat]
-            let child = SCNNode(geometry: geo)
-            child.name            = "planeGeom"
-            child.eulerAngles.x   = -.pi / 2
-            child.simdPosition    = anchor.center
-            root.addChildNode(child)
-            return root
+            let geo  = SCNPlane(width: CGFloat(a.planeExtent.width), height: CGFloat(a.planeExtent.height))
+            let mat  = SCNMaterial(); mat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.22); mat.isDoubleSided = true
+            geo.materials = [mat]
+            let child = SCNNode(geometry: geo); child.name = "planeGeom"
+            child.eulerAngles.x = -.pi / 2; child.simdPosition = a.center
+            root.addChildNode(child); return root
         }
 
-        private func updatePlaneNode(_ node: SCNNode, for anchor: ARPlaneAnchor) {
-            guard let child = node.childNode(withName: "planeGeom", recursively: false),
-                  let geo   = child.geometry as? SCNPlane else { return }
-            geo.width         = CGFloat(anchor.planeExtent.width)
-            geo.height        = CGFloat(anchor.planeExtent.height)
-            child.simdPosition = anchor.center
+        private func updatePlane(_ node: SCNNode, for a: ARPlaneAnchor) {
+            guard let c = node.childNode(withName: "planeGeom", recursively: false),
+                  let g = c.geometry as? SCNPlane else { return }
+            g.width = CGFloat(a.planeExtent.width); g.height = CGFloat(a.planeExtent.height)
+            c.simdPosition = a.center
         }
     }
 }
 
-// MARK: - 2-D hand silhouette overlay
+// MARK: - 3-D hand overlay
 
-/// Draws Quest-style transparent hand fills using pre-projected 2D segments.
-/// All coordinate math lives in the Coordinator; this view just paints lines.
-final class HandOverlayView: UIView {
-    private var hands: [HandOverlayHand] = []
+/// 21 joint spheres + 23 bone cylinders per hand, in world-space metres.
+/// Sized like real anatomy so they scale correctly with hand distance.
+/// Additive blending: overlapping volumes (palm, knuckles) add their glow
+/// together and reach near-white, while thinner areas (finger tips) stay
+/// semi-translucent — Quest-style fill without a real mesh.
+private final class Hand3DOverlay {
 
-    func update(_ hands: [HandOverlayHand]) {
-        self.hands = hands
-        setNeedsDisplay()
+    // Radii in metres, indexed parallel to HandTracker.allJoints.
+    private static let sphereR: [Float] = [
+        0.020,                                    // wrist
+        0.011, 0.010, 0.009, 0.008,               // thumb
+        0.012, 0.010, 0.009, 0.007,               // index
+        0.012, 0.010, 0.009, 0.007,               // middle
+        0.012, 0.010, 0.009, 0.007,               // ring
+        0.010, 0.009, 0.008, 0.006,               // little
+    ]
+    private static let cylR: Float = 0.008        // finger-width cylinder
+
+    private var sph: [[SCNNode]] = []   // [hand 0/1][joint 0-20]
+    private var cyl: [[SCNNode]] = []   // [hand 0/1][bone  0-22]
+
+    init(scene: SCNScene) {
+        for _ in 0..<2 {
+            var sNodes: [SCNNode] = []
+            var cNodes: [SCNNode] = []
+
+            for i in 0..<HandTracker.allJoints.count {
+                let geo = SCNSphere(radius: CGFloat(Self.sphereR[i]))
+                geo.segmentCount = 8          // low-poly — fine at finger scale
+                geo.materials    = [Self.mat()]
+                let n = SCNNode(geometry: geo)
+                n.isHidden = true; n.renderingOrder = 100
+                scene.rootNode.addChildNode(n)
+                sNodes.append(n)
+            }
+
+            for _ in 0..<HandTracker.boneConnections.count {
+                let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
+                geo.segmentCount = 6          // hexagonal — smooth enough at 8-mm scale
+                geo.materials    = [Self.mat()]
+                let n = SCNNode(geometry: geo)
+                n.isHidden = true; n.renderingOrder = 100
+                scene.rootNode.addChildNode(n)
+                cNodes.append(n)
+            }
+
+            sph.append(sNodes); cyl.append(cNodes)
+        }
     }
 
-    override func draw(_ rect: CGRect) {
-        guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        ctx.clear(rect)
-        for hand in hands { drawHand(hand, in: ctx) }
+    func update(hands: [HandTracker.HandResult]) {
+        sph.forEach { $0.forEach { $0.isHidden = true } }
+        cyl.forEach { $0.forEach { $0.isHidden = true } }
+
+        for hand in hands {
+            let h = hand.isLeft ? 0 : 1
+            guard h < 2 else { continue }
+
+            for (i, name) in HandTracker.allJoints.enumerated() {
+                guard let p = hand.joints[name] else { continue }
+                sph[h][i].simdPosition = p
+                sph[h][i].isHidden     = false
+            }
+
+            for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
+                guard let a = hand.joints[HandTracker.allJoints[fi]],
+                      let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
+                place(cyl[h][i], from: a, to: b)
+            }
+        }
     }
 
-    private func drawHand(_ hand: HandOverlayHand, in ctx: CGContext) {
-        ctx.saveGState()
+    // MARK: Helpers
 
-        // Outer glow pass — wide soft halo behind the hand.
-        ctx.setAlpha(0.25)
-        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-        ctx.setShadow(offset: .zero, blur: 28,
-                      color: UIColor.white.withAlphaComponent(0.9).cgColor)
-        ctx.setStrokeColor(UIColor.white.cgColor)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        for (i, (a, b)) in hand.segments.enumerated() {
-            ctx.setLineWidth(hand.isPalmSegment[i] ? 58 : 40)
-            ctx.move(to: a); ctx.addLine(to: b); ctx.strokePath()
-        }
-        ctx.endTransparencyLayer()
+    private static func mat() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel         = .constant     // unlit — not affected by scene lights
+        m.diffuse.contents      = UIColor.black
+        m.emission.contents     = UIColor(white: 0.32, alpha: 1.0)
+        m.blendMode             = .add          // additive: overlaps accumulate toward white
+        m.writesToDepthBuffer   = false         // hand nodes don't occlude each other
+        m.readsFromDepthBuffer  = true          // still occluded by opaque scene objects
+        m.isDoubleSided         = true
+        return m
+    }
 
-        // Solid fill pass — all segments drawn inside ONE transparency layer
-        // so overlapping bones merge into a single unified shape before compositing.
-        // No internal skeleton edges, just a smooth filled hand silhouette.
-        ctx.setAlpha(0.52)
-        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-        ctx.setStrokeColor(UIColor(white: 0.97, alpha: 1.0).cgColor)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        for (i, (a, b)) in hand.segments.enumerated() {
-            ctx.setLineWidth(hand.isPalmSegment[i] ? 52 : 36)
-            ctx.move(to: a); ctx.addLine(to: b); ctx.strokePath()
-        }
-        ctx.endTransparencyLayer()
-
-        ctx.restoreGState()
+    private func place(_ node: SCNNode, from a: SIMD3<Float>, to b: SIMD3<Float>) {
+        let diff = b - a
+        let len  = simd_length(diff)
+        guard len > 0.001 else { return }
+        let dir = diff / len
+        let up  = SIMD3<Float>(0, 1, 0)
+        let dot = simd_dot(dir, up)
+        let q: simd_quatf
+        if      dot >  0.9999 { q = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
+        else if dot < -0.9999 { q = simd_quatf(angle: .pi, axis: SIMD3(1, 0, 0)) }
+        else                   { q = simd_quatf(from: up, to: dir) }
+        node.simdPosition    = (a + b) * 0.5
+        node.simdOrientation = q
+        node.scale           = SCNVector3(1, Float(len), 1)
+        node.isHidden        = false
     }
 }
