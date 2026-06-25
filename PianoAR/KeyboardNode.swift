@@ -71,4 +71,38 @@ enum KeyboardNode {
 
         return root
     }
+
+    /// Transparent overlay for real-piano mode: faint glow planes over each white key
+    /// so key positions are visible without covering the actual piano underneath.
+    /// NoteHighway adds the key labels and active-note highlights on top of this.
+    static func makeOverlay() -> SCNNode {
+        let root     = SCNNode()
+        let leftEdge = -totalWidth / 2
+
+        // Shared barely-visible material — additive so it never blocks the camera feed.
+        let mat = SCNMaterial()
+        mat.lightingModel      = .constant
+        mat.diffuse.contents   = UIColor(white: 0.0, alpha: 0.0)
+        mat.emission.contents  = UIColor(white: 0.85, alpha: 0.10)
+        mat.blendMode          = .add
+        mat.isDoubleSided      = true
+        mat.writesToDepthBuffer = false
+
+        for key in keys where !key.isBlack {
+            let box = SCNBox(
+                width:        CGFloat(whiteKeyWidth  - 0.001),
+                height:       0.0012,
+                length:       CGFloat(whiteKeyDepth  - 0.002),
+                chamferRadius: 0.001
+            )
+            box.materials = [mat]
+            let node = SCNNode(geometry: box)
+            node.name          = "ov_\(key.noteName)"
+            node.simdPosition  = SIMD3<Float>(leftEdge + key.xCenter,
+                                              whiteKeyHeight + 0.001, 0)
+            root.addChildNode(node)
+        }
+
+        return root
+    }
 }

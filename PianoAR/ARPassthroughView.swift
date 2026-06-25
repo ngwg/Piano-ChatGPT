@@ -7,11 +7,12 @@ struct ARPassthroughView: UIViewRepresentable {
     let placement:   PlacementManager
     let calibration: CalibrationManager
     let handTracker: HandTracker
+    let songPlayer:  SongPlayer
     let onTap:       (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
-                    handTracker: handTracker, onTap: onTap)
+                    handTracker: handTracker, songPlayer: songPlayer, onTap: onTap)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -36,7 +37,8 @@ struct ARPassthroughView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         placement.sceneView   = uiView
         calibration.sceneView = uiView
-        context.coordinator.onTap = onTap
+        context.coordinator.onTap       = onTap
+        context.coordinator.songPlayer  = songPlayer
     }
 
     // MARK: - Coordinator
@@ -45,15 +47,19 @@ struct ARPassthroughView: UIViewRepresentable {
         let placement:   PlacementManager
         let calibration: CalibrationManager
         let handTracker: HandTracker
+        var songPlayer:  SongPlayer
         var onTap: (CGPoint) -> Void
 
-        private var hand3D: Hand3DOverlay?
+        private var hand3D:  Hand3DOverlay?
+        private var highway: NoteHighway?
 
         init(placement: PlacementManager, calibration: CalibrationManager,
-             handTracker: HandTracker, onTap: @escaping (CGPoint) -> Void) {
+             handTracker: HandTracker, songPlayer: SongPlayer,
+             onTap: @escaping (CGPoint) -> Void) {
             self.placement   = placement
             self.calibration = calibration
             self.handTracker = handTracker
+            self.songPlayer  = songPlayer
             self.onTap       = onTap
         }
 
@@ -76,17 +82,28 @@ struct ARPassthroughView: UIViewRepresentable {
 
             handTracker.maybeProcess(frame)
             hand3D?.update(hands: handTracker.snapshot())
+            highway?.update(player: songPlayer)
         }
 
         // MARK: Anchor → node
 
         func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
-            if anchor.name == "keyboard" { return KeyboardNode.make() }
+            if anchor.name == "keyboard" {
+                let n  = KeyboardNode.make()
+                let hw = NoteHighway()
+                n.addChildNode(hw.rootNode)
+                highway = hw
+                return n
+            }
             if anchor.name == "keyboard_calibrated" {
-                let n = KeyboardNode.make()
+                // Use the transparent overlay so the real piano keys remain visible.
+                let n = KeyboardNode.makeOverlay()
                 if let d = calibration.calibrationData {
                     n.scale = SCNVector3(d.widthScale, 1, d.depthScale)
                 }
+                let hw = NoteHighway()
+                n.addChildNode(hw.rootNode)
+                highway = hw
                 return n
             }
             if let name = anchor.name, name.hasPrefix("corner_") { return cornerMarker() }

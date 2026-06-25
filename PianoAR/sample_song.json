@@ -1,0 +1,21 @@
+{
+  "title": "C Major Scale",
+  "bpm": 72,
+  "notes": [
+    {"key": "C4", "startBeat": 0,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "D4", "startBeat": 1,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "E4", "startBeat": 2,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "F4", "startBeat": 3,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "G4", "startBeat": 4,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "A4", "startBeat": 5,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "B4", "startBeat": 6,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "C5", "startBeat": 7,  "durationBeats": 1.8, "hand": "right"},
+    {"key": "B4", "startBeat": 9,  "durationBeats": 0.9, "hand": "right"},
+    {"key": "A4", "startBeat": 10, "durationBeats": 0.9, "hand": "right"},
+    {"key": "G4", "startBeat": 11, "durationBeats": 0.9, "hand": "right"},
+    {"key": "F4", "startBeat": 12, "durationBeats": 0.9, "hand": "right"},
+    {"key": "E4", "startBeat": 13, "durationBeats": 0.9, "hand": "right"},
+    {"key": "D4", "startBeat": 14, "durationBeats": 0.9, "hand": "right"},
+    {"key": "C4", "startBeat": 15, "durationBeats": 1.8, "hand": "right"}
+  ]
+}

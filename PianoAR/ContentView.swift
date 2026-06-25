@@ -7,6 +7,7 @@ struct ContentView: View {
     @StateObject private var placement   = PlacementManager()
     @StateObject private var calibration = CalibrationManager()
     @StateObject private var handTracker = HandTracker()
+    @StateObject private var songPlayer  = SongPlayer()
     @State       private var mode: AppMode = .virtualPiano
 
     var body: some View {
@@ -16,6 +17,7 @@ struct ContentView: View {
                 placement:   placement,
                 calibration: calibration,
                 handTracker: handTracker,
+                songPlayer:  songPlayer,
                 onTap:       handleTap
             )
             .ignoresSafeArea()
@@ -23,10 +25,38 @@ struct ContentView: View {
             VStack {
                 topBar
                 Spacer()
+                playButton
                 bottomInstructions
             }
         }
         .background(Color.black)
+        .onAppear {
+            if let song = Song.load(named: "sample_song") {
+                songPlayer.load(song)
+            }
+        }
+    }
+
+    // MARK: Play button
+
+    private var playButton: some View {
+        Button {
+            if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: songPlayer.isPlaying ? "stop.fill" : "play.fill")
+                Text(songPlayer.isPlaying ? "Stop" : "Play Song")
+                    .font(.caption.bold())
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(songPlayer.isPlaying
+                ? Color.red.opacity(0.75)
+                : Color(red: 0.1, green: 0.5, blue: 0.9).opacity(0.85))
+            .foregroundStyle(.white)
+            .cornerRadius(10)
+        }
+        .padding(.bottom, 8)
     }
 
     // MARK: Top bar
@@ -150,7 +180,7 @@ private struct HUDPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("PianoAR — Phase 3")
+            Text("PianoAR — Phase 4")
                 .font(.caption.bold())
             Text("Tracking: \(session.trackingStateDescription)")
                 .font(.caption2)
