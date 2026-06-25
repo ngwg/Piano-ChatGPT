@@ -168,7 +168,7 @@ private final class Hand3DOverlay {
 
             for _ in 0..<HandTracker.boneConnections.count {
                 let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
-                geo.segmentCount = 6          // hexagonal — smooth enough at 8-mm scale
+                geo.radialSegmentCount = 6    // hexagonal — smooth enough at 8-mm scale
                 geo.materials    = [Self.mat()]
                 let n = SCNNode(geometry: geo)
                 n.isHidden = true; n.renderingOrder = 100
