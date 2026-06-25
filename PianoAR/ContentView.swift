@@ -9,6 +9,7 @@ struct ContentView: View {
     @StateObject private var handTracker = HandTracker()
     @StateObject private var songPlayer    = SongPlayer()
     @StateObject private var pressDetector = PressDetector()
+    @StateObject private var audioDetector = AudioPitchDetector()
     @State       private var mode: AppMode = .virtualPiano
     @State       private var showDebug = false
 
@@ -21,6 +22,7 @@ struct ContentView: View {
                 handTracker:   handTracker,
                 songPlayer:    songPlayer,
                 pressDetector: pressDetector,
+                audioDetector: audioDetector,
                 onTap:         handleTap
             )
             .ignoresSafeArea()
@@ -28,7 +30,7 @@ struct ContentView: View {
             VStack {
                 topBar
                 Spacer()
-                if !pressDetector.lastDetected.isEmpty {
+                if !pressDetector.lastDetected.isEmpty || !audioDetector.lastDetected.isEmpty {
                     detectedNoteLabel
                 }
                 playButton
@@ -41,13 +43,17 @@ struct ContentView: View {
             if let song = Song.load(named: "sample_song") {
                 songPlayer.load(song)
             }
+            audioDetector.start()
+        }
+        .onDisappear {
+            audioDetector.stop()
         }
     }
 
     // MARK: Detected note label
 
     private var detectedNoteLabel: some View {
-        Text("♪ \(pressDetector.lastDetected)")
+        Text(detectionText)
             .font(.title2.bold())
             .foregroundStyle(.green)
             .padding(.horizontal, 14)
@@ -55,6 +61,13 @@ struct ContentView: View {
             .background(.black.opacity(0.6))
             .cornerRadius(8)
             .padding(.bottom, 4)
+    }
+
+    private var detectionText: String {
+        if !pressDetector.lastDetected.isEmpty {
+            return "Vision \(pressDetector.lastDetected)"
+        }
+        return "Mic \(audioDetector.lastDetected)"
     }
 
     // MARK: Play button
@@ -84,7 +97,8 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(alignment: .top) {
             HUDPanel(session: session, placement: placement,
-                     calibration: calibration, handTracker: handTracker, mode: mode)
+                     calibration: calibration, handTracker: handTracker,
+                     audioDetector: audioDetector, mode: mode)
                 .padding(12)
             Spacer()
             VStack(spacing: 8) {
@@ -112,6 +126,12 @@ struct ContentView: View {
             Text("Press Detection Debug")
                 .font(.caption.bold())
             ForEach(pressDetector.fingerDebugLines, id: \.self) { line in
+                Text(line).font(.system(size: 9, design: .monospaced))
+            }
+            Text("Mic Detection Debug")
+                .font(.caption.bold())
+                .padding(.top, 6)
+            ForEach(audioDetector.fingerDebugLines, id: \.self) { line in
                 Text(line).font(.system(size: 9, design: .monospaced))
             }
         }
@@ -228,6 +248,7 @@ private struct HUDPanel: View {
     @ObservedObject var placement:   PlacementManager
     @ObservedObject var calibration: CalibrationManager
     @ObservedObject var handTracker: HandTracker
+    @ObservedObject var audioDetector: AudioPitchDetector
     let mode: AppMode
 
     var body: some View {
@@ -243,6 +264,9 @@ private struct HUDPanel: View {
             Text("Hands: \(handTracker.detectedHandCount)")
                 .font(.caption2)
                 .foregroundStyle(handTracker.detectedHandCount > 0 ? .green : .secondary)
+            Text("Mic: \(audioDetector.microphoneState)")
+                .font(.caption2)
+                .foregroundStyle(audioDetector.microphoneState == "mic listening" ? .green : .secondary)
         }
         .padding(8)
         .background(.black.opacity(0.55))

@@ -47,7 +47,8 @@ final class PressDetector: ObservableObject {
     /// Call from `renderer(_:updateAtTime:)`. Returns newly detected presses this frame.
     func update(hands: [HandTracker.HandResult],
                 keyboardNode: SCNNode?,
-                time: TimeInterval) -> [PressEvent] {
+                time: TimeInterval,
+                audioSnapshot: PitchSnapshot? = nil) -> [PressEvent] {
         guard let kb = keyboardNode else { return [] }
 
         var newPresses: [PressEvent] = []
@@ -75,6 +76,9 @@ final class PressDetector: ObservableObject {
 
                 // Which key is this finger over?
                 let key = findKey(localX: local.x, localZ: local.z)
+                let micBoost = key.map {
+                    audioBoost(for: $0.index, snapshot: audioSnapshot, time: time)
+                } ?? 0
                 let surfaceY: Float = (key?.isBlack == true)
                     ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
                     : KeyboardLayout.whiteKeyHeight
@@ -110,7 +114,8 @@ final class PressDetector: ObservableObject {
                         if let k = key,
                            (decelerated || depth < -pressDepth * 2.5),
                            time - track.lastPressTime > debounceInterval {
-                            let conf = min(1.0, abs(depth) / 0.020)
+                            let baseConf = min(1.0, abs(depth) / 0.020)
+                            let conf = min(1.0, baseConf + micBoost)
                             newPresses.append(PressEvent(
                                 keyIndex: k.index,
                                 noteName: k.noteName,
@@ -138,7 +143,8 @@ final class PressDetector: ObservableObject {
 
                 let keyName = key?.noteName ?? "—"
                 let depthMM = String(format: "%+.1f", depth * 1000)
-                debugLines.append("\(fid) \(depthMM)mm \(track.phase.rawValue) [\(keyName)]")
+                let micTag = micBoost > 0 ? " mic+\(String(format: "%.2f", micBoost))" : ""
+                debugLines.append("\(fid) \(depthMM)mm \(track.phase.rawValue) [\(keyName)]\(micTag)")
             }
         }
 
@@ -198,5 +204,21 @@ final class PressDetector: ObservableObject {
             if abs(relX - key.xCenter) < halfW { return key }
         }
         return nil
+    }
+
+    private func audioBoost(for keyIndex: Int,
+                            snapshot: PitchSnapshot?,
+                            time: TimeInterval) -> Float {
+        guard let snapshot,
+              abs(time - snapshot.timestamp) <= 0.16
+        else { return 0 }
+
+        let onsets = snapshot.activeNotes.filter(\.isOnset)
+        guard !onsets.isEmpty else { return 0 }
+
+        if onsets.contains(where: { $0.keyIndex == keyIndex }) {
+            return 0.25
+        }
+        return 0.08
     }
 }

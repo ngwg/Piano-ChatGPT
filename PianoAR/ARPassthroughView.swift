@@ -9,12 +9,14 @@ struct ARPassthroughView: UIViewRepresentable {
     let handTracker:   HandTracker
     let songPlayer:    SongPlayer
     let pressDetector: PressDetector
+    let audioDetector: AudioPitchDetector
     let onTap:         (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
-                    pressDetector: pressDetector, onTap: onTap)
+                    pressDetector: pressDetector, audioDetector: audioDetector,
+                    onTap: onTap)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -42,6 +44,7 @@ struct ARPassthroughView: UIViewRepresentable {
         context.coordinator.onTap          = onTap
         context.coordinator.songPlayer     = songPlayer
         context.coordinator.pressDetector  = pressDetector
+        context.coordinator.audioDetector  = audioDetector
     }
 
     // MARK: - Coordinator
@@ -52,21 +55,24 @@ struct ARPassthroughView: UIViewRepresentable {
         let handTracker:   HandTracker
         var songPlayer:    SongPlayer
         var pressDetector: PressDetector
+        var audioDetector: AudioPitchDetector
         var onTap: (CGPoint) -> Void
 
         private var hand3D:  Hand3DOverlay?
         private var highway: NoteHighway?
         private weak var keyboardNode: SCNNode?
+        private var lastAudioSnapshotTime: TimeInterval = 0
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
-             pressDetector: PressDetector,
+             pressDetector: PressDetector, audioDetector: AudioPitchDetector,
              onTap: @escaping (CGPoint) -> Void) {
             self.placement     = placement
             self.calibration   = calibration
             self.handTracker   = handTracker
             self.songPlayer    = songPlayer
             self.pressDetector = pressDetector
+            self.audioDetector = audioDetector
             self.onTap         = onTap
         }
 
@@ -89,17 +95,29 @@ struct ARPassthroughView: UIViewRepresentable {
 
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
+            let audio = audioDetector.snapshot()
             hand3D?.update(hands: hands)
 
             // Press detection: fingertip depth vs. keyboard surface
             let presses = pressDetector.update(
-                hands: hands, keyboardNode: keyboardNode, time: time
+                hands: hands, keyboardNode: keyboardNode, time: time,
+                audioSnapshot: audio
             )
             for p in presses {
                 highway?.registerPress(keyIndex: p.keyIndex)
             }
 
+            for note in consumeAudioOnsets(audio) {
+                highway?.registerPress(keyIndex: note.keyIndex)
+            }
+
             highway?.update(player: songPlayer)
+        }
+
+        private func consumeAudioOnsets(_ snapshot: PitchSnapshot) -> [DetectedNote] {
+            guard snapshot.timestamp > lastAudioSnapshotTime else { return [] }
+            lastAudioSnapshotTime = snapshot.timestamp
+            return snapshot.activeNotes.filter(\.isOnset)
         }
 
         // MARK: Anchor → node

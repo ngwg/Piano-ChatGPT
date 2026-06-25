@@ -298,6 +298,7 @@ final class NoteHighway {
             barPool.forEach    { $0.isHidden = true }
             labelPool.forEach  { $0.isHidden = true }
             highlights.forEach { $0?.isHidden = true }
+            updatePressFlashes()
             return
         }
 
@@ -376,6 +377,10 @@ final class NoteHighway {
         }
 
         // ── Press-detection flashes (override note highlights) ─────────
+        updatePressFlashes()
+    }
+
+    private func updatePressFlashes() {
         let now = CACurrentMediaTime()
         var expired: [Int] = []
         for (keyIndex, startTime) in pressFlashes {
