@@ -32,12 +32,18 @@ final class AudioPitchDetector: ObservableObject {
     private let hop = 2048
     private let log2n: vDSP_Length = 13
 
-    private let silenceRMS: Float = 0.00035
-    private let onsetRatio: Float = 2.6
-    private let activeFloorRatio: Float = 1.7
-    private let onsetFloorRatio: Float = 2.4
-    private let maxPublishedNotes = 6
-    private let minOnsetInterval: TimeInterval = 0.09
+    private let silenceRMS: Float = 0.0018
+    private let minAttackRMS: Float = 0.0045
+    private let ambientAttackRatio: Float = 3.5
+    private let rmsAttackRatio: Float = 1.6
+    private let energyAttackRatio: Float = 2.2
+    private let tonalPeakFloorRatio: Float = 8.0
+    private let tonalPeakShare: Float = 0.06
+    private let onsetRatio: Float = 4.0
+    private let activeFloorRatio: Float = 3.0
+    private let onsetFloorRatio: Float = 5.0
+    private let maxPublishedNotes = 3
+    private let minOnsetInterval: TimeInterval = 0.14
 
     // Computed from the actual input sample rate in configureAndStart().
     private var binRes: Float = 1
@@ -67,6 +73,10 @@ final class AudioPitchDetector: ObservableObject {
     private var active: [Bool] = .init(repeating: false, count: 88)
     private var decayCnt: [Int] = .init(repeating: 0, count: 88)
     private var lastOnsetTime: [TimeInterval] = .init(repeating: 0, count: 88)
+    private var ambientRMS: Float = 0.002
+    private var previousRMS: Float = 0
+    private var previousTotalEnergy: Float = 0
+    private var lastAttackTime: TimeInterval = 0
 
     private let engine = AVAudioEngine()
     private let stateQueue = DispatchQueue(label: "com.pianoar.audio-detector.state")
@@ -231,6 +241,9 @@ final class AudioPitchDetector: ObservableObject {
         let rms = rootMeanSquare(frame)
         let now = CACurrentMediaTime()
         guard rms >= silenceRMS else {
+            updateAmbientNoise(rms: rms, isAttack: false)
+            previousRMS = rms
+            previousTotalEnergy = 0
             decayForSilence(timestamp: now)
             return
         }
@@ -243,10 +256,33 @@ final class AudioPitchDetector: ObservableObject {
 
         let floor = noiseFloor()
         suppressHarmonics(floor: floor)
-        let detected = trackNotes(floor: floor, timestamp: now)
+        let totalEnergy = energy.reduce(Float(0), +)
+        let strongestEnergy = energy.max() ?? 0
+        let frameAttack = isPianoAttack(
+            rms: rms,
+            totalEnergy: totalEnergy,
+            strongestEnergy: strongestEnergy,
+            floor: floor,
+            timestamp: now
+        )
+        let detected = trackNotes(
+            floor: floor,
+            timestamp: now,
+            allowOnsets: frameAttack
+        )
+
+        updateAmbientNoise(rms: rms, isAttack: frameAttack)
+        previousRMS = rms
+        previousTotalEnergy = totalEnergy
 
         publishSnapshot(detected, timestamp: now)
-        publishUI(detected, floor: floor, rms: rms, timestamp: now)
+        publishUI(
+            detected,
+            floor: floor,
+            rms: rms,
+            frameAttack: frameAttack,
+            timestamp: now
+        )
     }
 
     private func rootMeanSquare(_ values: [Float]) -> Float {
@@ -255,6 +291,34 @@ final class AudioPitchDetector: ObservableObject {
             sum += v * v
         }
         return sqrtf(sum / Float(max(values.count, 1)))
+    }
+
+    private func isPianoAttack(rms: Float,
+                               totalEnergy: Float,
+                               strongestEnergy: Float,
+                               floor: Float,
+                               timestamp: TimeInterval) -> Bool {
+        let noiseGate = max(minAttackRMS, ambientRMS * ambientAttackRatio)
+        let aboveNoise = rms >= noiseGate
+        let rmsJump = previousRMS <= 0
+            ? rms >= minAttackRMS
+            : rms >= previousRMS * rmsAttackRatio
+        let energyJump = previousTotalEnergy <= 0
+            ? totalEnergy > 0
+            : totalEnergy >= previousTotalEnergy * energyAttackRatio
+        let tonalEnough = strongestEnergy >= floor * tonalPeakFloorRatio
+            && strongestEnergy >= totalEnergy * tonalPeakShare
+        let cooledDown = timestamp - lastAttackTime >= minOnsetInterval
+
+        guard aboveNoise, rmsJump, energyJump, tonalEnough, cooledDown else { return false }
+        lastAttackTime = timestamp
+        return true
+    }
+
+    private func updateAmbientNoise(rms: Float, isAttack: Bool) {
+        guard !isAttack else { return }
+        let clamped = min(rms, ambientRMS * 2.0 + 0.0005)
+        ambientRMS = ambientRMS * 0.98 + clamped * 0.02
     }
 
     private func decayForSilence(timestamp: TimeInterval) {
@@ -377,20 +441,24 @@ final class AudioPitchDetector: ObservableObject {
         let onset: Bool
     }
 
-    private func trackNotes(floor: Float, timestamp: TimeInterval) -> [DetectedNote] {
+    private func trackNotes(floor: Float,
+                            timestamp: TimeInterval,
+                            allowOnsets: Bool) -> [DetectedNote] {
         var candidates: [NoteCandidate] = []
 
         for i in 0..<88 {
             let e = energy[i]
             let strong = e > floor * activeFloorRatio
             let rising = e > max(prevEnergy[i] * onsetRatio, floor * onsetFloorRatio)
-            let onset = rising && timestamp - lastOnsetTime[i] > minOnsetInterval
+            let onset = allowOnsets
+                && rising
+                && timestamp - lastOnsetTime[i] > minOnsetInterval
 
             if onset {
                 lastOnsetTime[i] = timestamp
             }
 
-            if strong {
+            if strong && (allowOnsets || active[i]) {
                 decayCnt[i] = 0
                 active[i] = true
             } else {
@@ -441,6 +509,7 @@ final class AudioPitchDetector: ObservableObject {
     private func publishUI(_ notes: [DetectedNote],
                            floor: Float,
                            rms: Float,
+                           frameAttack: Bool,
                            timestamp: TimeInterval) {
         guard timestamp - lastUI > 0.08 else { return }
         lastUI = timestamp
@@ -448,23 +517,20 @@ final class AudioPitchDetector: ObservableObject {
         let onsets = notes
             .filter(\.isOnset)
             .map { KeyboardLayout.keys[$0.keyIndex].noteName }
-        let actives = notes.map { KeyboardLayout.keys[$0.keyIndex].noteName }
-
-        let label: String
-        if !onsets.isEmpty {
-            label = onsets.joined(separator: " ")
-        } else if !actives.isEmpty {
-            label = actives.joined(separator: " ")
-        } else {
-            label = ""
-        }
+        let label = onsets.joined(separator: " ")
 
         var dbg = notes.prefix(10).map { note -> String in
             let name = KeyboardLayout.keys[note.keyIndex].noteName
             let magText = String(format: "%.2f", note.magnitude)
             return "\(name) \(magText)\(note.isOnset ? " ON" : "")"
         }
-        dbg.append(String(format: "rms %.4f floor %.2e", rms, floor))
+        dbg.append(String(
+            format: "rms %.4f amb %.4f floor %.2e%@",
+            rms,
+            ambientRMS,
+            floor,
+            frameAttack ? " ATTACK" : ""
+        ))
 
         DispatchQueue.main.async { [weak self] in
             self?.lastDetected = label
@@ -489,5 +555,9 @@ final class AudioPitchDetector: ObservableObject {
         active = .init(repeating: false, count: 88)
         decayCnt = .init(repeating: 0, count: 88)
         lastOnsetTime = .init(repeating: 0, count: 88)
+        ambientRMS = 0.002
+        previousRMS = 0
+        previousTotalEnergy = 0
+        lastAttackTime = 0
     }
 }
