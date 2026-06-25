@@ -7,8 +7,7 @@ final class HandTracker: ObservableObject {
 
     struct HandResult {
         let isLeft: Bool
-        var joints:   [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
-        var joints2D: [VNHumanHandPoseObservation.JointName: CGPoint]
+        var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
     }
 
     static let allJoints: [VNHumanHandPoseObservation.JointName] = [
@@ -29,37 +28,30 @@ final class HandTracker: ObservableObject {
         (5,9),(9,13),(13,17),
     ]
 
+    // Palm-adjacent bones get thicker strokes in the overlay
+    static let isPalmBone: Set<Int> = [4, 8, 12, 16, 20, 21, 22]
+
     private var _hands: [HandResult] = []
     private let lock         = NSLock()
     private var isProcessing = false
     private var frameCount   = 0
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
-    private var smoothed3D:  [String: SIMD3<Float>] = [:]
-    private var smoothed2D:  [String: CGPoint]      = [:]
-
-    weak var sceneView: ARSCNView?
+    private var smoothed:    [String: SIMD3<Float>] = [:]
 
     // MARK: - Public
 
-    func maybeProcess(_ frame: ARFrame, viewportSize: CGSize) {
+    func maybeProcess(_ frame: ARFrame) {
         frameCount += 1
         guard frameCount % 3 == 0, !isProcessing else { return }
         isProcessing = true
 
-        let pixelBuffer      = frame.capturedImage
-        let camera           = frame.camera
-        // Capture display transform on the calling thread (ARKit frame data is not thread-safe).
-        // This transform maps from the camera's raw landscape image normalized coords
-        // (top-left origin, [0,1]×[0,1]) to portrait viewport normalized coords (top-left origin).
-        let displayTransform = frame.displayTransform(for: .portrait, viewportSize: viewportSize)
-        let planeY: Float    = frame.anchors
-            .first { $0.name == "keyboard" || $0.name == "keyboard_calibrated" }
-            .map { $0.transform.columns.3.y } ?? -0.3
+        let pixelBuffer = frame.capturedImage
+        let camera      = frame.camera
+        // Prefer smoothed depth (fewer holes); fall back to raw sceneDepth.
+        let depthMap    = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
 
         visionQueue.async { [weak self] in
-            self?.run(pixelBuffer: pixelBuffer, camera: camera,
-                      planeY: planeY, displayTransform: displayTransform,
-                      viewportSize: viewportSize)
+            self?.run(pixelBuffer: pixelBuffer, camera: camera, depthMap: depthMap)
         }
     }
 
@@ -68,87 +60,96 @@ final class HandTracker: ObservableObject {
         return _hands
     }
 
-    // MARK: - Vision
+    // MARK: - Vision + LiDAR
 
-    private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, planeY: Float,
-                     displayTransform: CGAffineTransform, viewportSize: CGSize) {
+    private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, depthMap: CVPixelBuffer?) {
         defer { isProcessing = false }
 
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 2
 
-        // Use .up (no orientation correction) so Vision returns coordinates in the
-        // raw landscape camera image space (y-up, bottom-left origin).
-        // We then map these through ARKit's displayTransform which correctly handles
-        // the 90° rotation + aspect-fill crop needed to match the ARSCNView display.
+        // .up = no rotation: Vision returns raw landscape image coords (y-up, bottom-left).
+        // We convert to camera pixel space ourselves so we can sample the LiDAR depth map
+        // at the exact pixel, then unproject via camera intrinsics for a correct 3D position.
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
                                             orientation: .up, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
         else { commit([], count: 0); return }
 
-        var planeTransform = matrix_identity_float4x4
-        planeTransform.columns.3 = SIMD4<Float>(0, planeY, 0, 1)
-
+        let imgW = Float(camera.imageResolution.width)
+        let imgH = Float(camera.imageResolution.height)
         var results: [HandResult] = []
 
         for obs in observations {
-            let side = obs.chirality == .left ? "L" : "R"
-            var joints3D: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
-            var joints2D: [VNHumanHandPoseObservation.JointName: CGPoint]      = [:]
+            let side  = obs.chirality == .left ? "L" : "R"
+            var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
 
             for name in HandTracker.allJoints {
                 guard let pt = try? obs.recognizedPoint(name), pt.confidence > 0.2 else { continue }
 
-                // Vision returns (x,y) with y-up, origin bottom-left.
-                // ARKit's displayTransform expects standard image coords: y-down, origin top-left.
-                // So flip y before applying the transform.
-                let imageNorm = CGPoint(x: CGFloat(pt.location.x),
-                                        y: 1.0 - CGFloat(pt.location.y))
+                // Vision (y-up, bottom-left) → camera image pixel (y-down, top-left).
+                let px = Float(pt.location.x) * imgW
+                let py = (1.0 - Float(pt.location.y)) * imgH
 
-                // Map to viewport-normalized coords [0,1] (top-left origin, portrait).
-                let vpNorm = imageNorm.applying(displayTransform)
+                // Sample LiDAR depth at this pixel; fall back to 0.4 m if unavailable.
+                let depth = depthMap.flatMap {
+                    sampleDepth(from: $0, px: px, py: py, imgW: imgW, imgH: imgH)
+                } ?? 0.4
 
-                // Convert to screen pixels.
-                let vp = CGPoint(x: vpNorm.x * viewportSize.width,
-                                 y: vpNorm.y * viewportSize.height)
+                // Compute world-space position via camera intrinsics (no plane assumption).
+                let world = cameraPixelToWorld(px: px, py: py, depth: depth, camera: camera)
 
-                // Exponential moving average for jitter reduction (2D).
-                let key2 = "\(side)_2d_\(name.rawValue)"
-                let s2: CGPoint
-                if let prev = smoothed2D[key2] {
-                    s2 = CGPoint(x: prev.x + 0.4 * (vp.x - prev.x),
-                                 y: prev.y + 0.4 * (vp.y - prev.y))
-                } else {
-                    s2 = vp
-                }
-                smoothed2D[key2] = s2
-                joints2D[name] = s2
-
-                // 3D position via LiDAR-informed unproject onto keyboard plane.
-                if let world = camera.unprojectPoint(
-                    s2, ontoPlane: planeTransform,
-                    orientation: .portrait, viewportSize: viewportSize
-                ) {
-                    let key3 = "\(side)_3d_\(name.rawValue)"
-                    let s3: SIMD3<Float>
-                    if let prev = smoothed3D[key3] {
-                        s3 = prev + 0.35 * (world - prev)
-                    } else {
-                        s3 = world
-                    }
-                    smoothed3D[key3] = s3
-                    joints3D[name] = s3
-                }
+                // EMA smoothing (α = 0.4).
+                let key = "\(side)_\(name.rawValue)"
+                let s   = smoothed[key].map { $0 + 0.4 * (world - $0) } ?? world
+                smoothed[key] = s
+                joints[name]  = s
             }
 
-            if !joints2D.isEmpty {
-                results.append(HandResult(isLeft: obs.chirality == .left,
-                                          joints: joints3D, joints2D: joints2D))
+            if !joints.isEmpty {
+                results.append(HandResult(isLeft: obs.chirality == .left, joints: joints))
             }
         }
 
         commit(results, count: observations.count)
+    }
+
+    // MARK: - Helpers
+
+    private func sampleDepth(from map: CVPixelBuffer,
+                               px: Float, py: Float,
+                               imgW: Float, imgH: Float) -> Float? {
+        let dW = CVPixelBufferGetWidth(map)
+        let dH = CVPixelBufferGetHeight(map)
+        let dx = max(0, min(dW - 1, Int((px / imgW * Float(dW)).rounded())))
+        let dy = max(0, min(dH - 1, Int((py / imgH * Float(dH)).rounded())))
+
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+
+        guard let base = CVPixelBufferGetBaseAddress(map) else { return nil }
+        let bpr = CVPixelBufferGetBytesPerRow(map)
+        let val  = base.assumingMemoryBound(to: Float32.self)[dy * (bpr / 4) + dx]
+        return (val > 0.05 && val < 5.0 && val.isFinite) ? val : nil
+    }
+
+    /// Converts a camera-image pixel + LiDAR depth to an ARKit world-space position.
+    /// ARKit camera: right-handed, looks along -Z, Y is up.
+    /// Image coords: x-right, y-down (top-left origin).
+    private func cameraPixelToWorld(px: Float, py: Float,
+                                     depth: Float, camera: ARCamera) -> SIMD3<Float> {
+        let fx = camera.intrinsics[0][0]
+        let fy = camera.intrinsics[1][1]
+        let cx = camera.intrinsics[2][0]
+        let cy = camera.intrinsics[2][1]
+
+        let xc =  (px - cx) / fx * depth   // camera x (right)
+        let yc = -(py - cy) / fy * depth   // flip: image y-down → camera y-up
+        let zc = -depth                    // scene is at negative z in camera space
+
+        let w = camera.transform * SIMD4<Float>(xc, yc, zc, 1.0)
+        return SIMD3<Float>(w.x, w.y, w.z)
     }
 
     private func commit(_ hands: [HandResult], count: Int) {
