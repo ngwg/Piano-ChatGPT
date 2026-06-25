@@ -61,7 +61,6 @@ struct ARPassthroughView: UIViewRepresentable {
         private var hand3D:  Hand3DOverlay?
         private var highway: NoteHighway?
         private weak var keyboardNode: SCNNode?
-        private var lastAudioSnapshotTime: TimeInterval = 0
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
@@ -107,18 +106,9 @@ struct ARPassthroughView: UIViewRepresentable {
                 highway?.registerPress(keyIndex: p.keyIndex)
             }
 
-            for note in consumeAudioOnsets(audio) {
-                highway?.registerPress(keyIndex: note.keyIndex)
-            }
-
             highway?.update(player: songPlayer)
         }
 
-        private func consumeAudioOnsets(_ snapshot: PitchSnapshot) -> [DetectedNote] {
-            guard snapshot.timestamp > lastAudioSnapshotTime else { return [] }
-            lastAudioSnapshotTime = snapshot.timestamp
-            return snapshot.activeNotes.filter(\.isOnset)
-        }
 
         // MARK: Anchor → node
 

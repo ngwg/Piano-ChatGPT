@@ -18,6 +18,7 @@ final class PressDetector: ObservableObject {
     private let pressDepth: Float = 0.008         // 8 mm below key surface → press
     private let minDescendVel: Float = -0.001     // m/frame downward to enter "descending"
     private let debounceInterval: TimeInterval = 0.18
+    private let keyLockoutInterval: TimeInterval = 0.24
     private let historyCount = 12
     private let flashRetain: TimeInterval = 2.0   // keep recent presses for UI
 
@@ -32,6 +33,7 @@ final class PressDetector: ObservableObject {
 
     private var fingers: [String: FingerTrack] = [:]
     private var recentPresses: [PressEvent] = []
+    private var lastKeyPressTime: [TimeInterval] = .init(repeating: -999, count: 88)
     private var lastDebugUpdate: TimeInterval = 0
 
     private static let tips: [(VNHumanHandPoseObservation.JointName, String)] = [
@@ -113,7 +115,8 @@ final class PressDetector: ObservableObject {
 
                         if let k = key,
                            (decelerated || depth < -pressDepth * 2.5),
-                           time - track.lastPressTime > debounceInterval {
+                           time - track.lastPressTime > debounceInterval,
+                           time - lastKeyPressTime[k.index] > keyLockoutInterval {
                             let baseConf = min(1.0, abs(depth) / 0.020)
                             let conf = min(1.0, baseConf + micBoost)
                             newPresses.append(PressEvent(
@@ -125,6 +128,7 @@ final class PressDetector: ObservableObject {
                             ))
                             track.phase = .pressed
                             track.lastPressTime = time
+                            lastKeyPressTime[k.index] = time
                         }
                     }
                     // Finger retreated without reaching threshold
@@ -181,6 +185,7 @@ final class PressDetector: ObservableObject {
     func reset() {
         fingers.removeAll()
         recentPresses.removeAll()
+        lastKeyPressTime = .init(repeating: -999, count: 88)
     }
 
     // MARK: - Key lookup from keyboard-local coordinates
@@ -206,19 +211,14 @@ final class PressDetector: ObservableObject {
         return nil
     }
 
-    private func audioBoost(for keyIndex: Int,
+    private func audioBoost(for _: Int,
                             snapshot: PitchSnapshot?,
                             time: TimeInterval) -> Float {
         guard let snapshot,
-              abs(time - snapshot.timestamp) <= 0.16
+              let attack = snapshot.attack,
+              abs(time - attack.timestamp) <= 0.12
         else { return 0 }
 
-        let onsets = snapshot.activeNotes.filter(\.isOnset)
-        guard !onsets.isEmpty else { return 0 }
-
-        if onsets.contains(where: { $0.keyIndex == keyIndex }) {
-            return 0.25
-        }
-        return 0.08
+        return 0.10 + attack.confidence * 0.16
     }
 }

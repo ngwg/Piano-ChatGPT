@@ -7,96 +7,100 @@ import QuartzCore
 struct DetectedNote {
     let keyIndex: Int       // 0...87
     let midiNote: Int       // 21...108
-    let magnitude: Float    // 0...1 normalized within the current frame
-    let isOnset: Bool       // true only on the first analysis frame of an attack
+    let magnitude: Float    // 0...1 normalized debug confidence
+    let isOnset: Bool       // true when this is the pitch hint nearest an attack
 }
 
-struct PitchSnapshot {
-    let activeNotes: [DetectedNote]
+struct AudioAttack {
+    let confidence: Float
+    let onsetScore: Float
+    let lowBandScore: Float
+    let midBandScore: Float
+    let highBandScore: Float
+    let pitchHintKeyIndex: Int?
     let timestamp: TimeInterval
 }
 
-/// Conservative microphone note/onset detector.
+struct PitchSnapshot {
+    let activeNotes: [DetectedNote]  // Debug pitch hints only; vision owns note identity.
+    let attack: AudioAttack?
+    let timestamp: TimeInterval
+}
+
+/// Microphone-side piano attack detector.
 ///
-/// This is intentionally a confidence/debug signal, not a replacement for the
-/// LiDAR + hand trajectory press detector. It is best at clear attacks and
-/// monophonic or sparse passages; dense chords should be treated as hints.
+/// The mic path intentionally avoids being the source of truth for note names.
+/// Acoustic piano transcription from a phone mic is a hard problem; in this app
+/// calibrated key geometry + fingertip position should identify the key, while
+/// audio answers "did a piano-like attack happen right now?"
 final class AudioPitchDetector: ObservableObject {
     @Published var lastDetected: String = ""
     @Published var fingerDebugLines: [String] = []
     @Published private(set) var microphoneState: String = "mic off"
 
-    // FFT parameters: 8192 samples gives useful low-note resolution, while the
-    // hop keeps UI feedback responsive enough for press corroboration.
-    private let fftN = 8192
-    private let hop = 2048
-    private let log2n: vDSP_Length = 13
+    // Short-window STFT for onset timing. 2048 @ 48 kHz is ~43 ms, hop 512 is
+    // ~11 ms, which is much better for treble attacks than the old 8192 window.
+    private let fftN = 2048
+    private let hop = 512
+    private let log2n: vDSP_Length = 11
 
-    private let silenceRMS: Float = 0.0018
-    private let minAttackRMS: Float = 0.0045
-    private let ambientAttackRatio: Float = 3.5
-    private let rmsAttackRatio: Float = 1.6
-    private let energyAttackRatio: Float = 2.2
-    private let tonalPeakFloorRatio: Float = 8.0
-    private let tonalPeakShare: Float = 0.06
-    private let onsetRatio: Float = 4.0
-    private let activeFloorRatio: Float = 3.0
-    private let onsetFloorRatio: Float = 5.0
-    private let maxPublishedNotes = 3
-    private let minOnsetInterval: TimeInterval = 0.14
+    private let minRMS: Float = 0.0012
+    private let ambientRMSRatio: Float = 2.2
+    private let minFluxScore: Float = 0.22
+    private let ambientFluxRatio: Float = 3.2
+    private let minAttackInterval: TimeInterval = 0.13
+    private let maxPitchHints = 3
 
-    // Computed from the actual input sample rate in configureAndStart().
-    private var binRes: Float = 1
+    private var binRes: Float = 48_000 / 2048
     private var keyBins: [Int] = []
 
-    // A0 (27.5 Hz) through C8 (4186 Hz).
     private static let keyFreqs: [Float] = (0..<88).map {
         440.0 * powf(2.0, Float(21 + $0 - 69) / 12.0)
     }
 
-    // Pre-allocated FFT buffers.
     private var fftSetup: FFTSetup!
     private var window: [Float]
     private var frame: [Float]
     private var rp: [Float]
     private var ip: [Float]
-    private var mag: [Float]
+    private var power: [Float]
+    private var spectrum: [Float]
+    private var prevSpectrum: [Float]
 
-    // Circular sample buffer.
     private var ring: [Float]
     private var ringW = 0
     private var hopAcc = 0
 
-    // Per-key state.
-    private var energy: [Float] = .init(repeating: 0, count: 88)
-    private var prevEnergy: [Float] = .init(repeating: 0, count: 88)
-    private var active: [Bool] = .init(repeating: false, count: 88)
-    private var decayCnt: [Int] = .init(repeating: 0, count: 88)
-    private var lastOnsetTime: [TimeInterval] = .init(repeating: 0, count: 88)
+    // Debug pitch hints.
+    private var keyEnergy: [Float] = .init(repeating: 0, count: 88)
+
+    // Adaptive attack gates.
     private var ambientRMS: Float = 0.002
-    private var previousRMS: Float = 0
-    private var previousTotalEnergy: Float = 0
+    private var ambientFlux: Float = 0.08
     private var lastAttackTime: TimeInterval = 0
+    private var hasPreviousSpectrum = false
 
     private let engine = AVAudioEngine()
     private let stateQueue = DispatchQueue(label: "com.pianoar.audio-detector.state")
     private var tapInstalled = false
     private var running = false
 
-    // Thread-safe snapshot for the render thread.
     private let lock = NSLock()
-    private var _snap = PitchSnapshot(activeNotes: [], timestamp: 0)
+    private var _snap = PitchSnapshot(activeNotes: [], attack: nil, timestamp: 0)
     private var lastUI: TimeInterval = 0
 
     init() {
         fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))!
+
         window = [Float](repeating: 0, count: fftN)
         vDSP_hann_window(&window, vDSP_Length(fftN), Int32(vDSP_HANN_NORM))
 
         frame = .init(repeating: 0, count: fftN)
         rp = .init(repeating: 0, count: fftN / 2)
         ip = .init(repeating: 0, count: fftN / 2)
-        mag = .init(repeating: 0, count: fftN / 2)
+        power = .init(repeating: 0, count: fftN / 2)
+        spectrum = .init(repeating: 0, count: fftN / 2)
+        prevSpectrum = .init(repeating: 0, count: fftN / 2)
         ring = .init(repeating: 0, count: fftN)
     }
 
@@ -117,7 +121,7 @@ final class AudioPitchDetector: ObservableObject {
             stateQueue.async { [weak self] in self?.configureAndStart() }
         case .denied:
             publishState("mic denied")
-            publishSnapshot([], timestamp: CACurrentMediaTime())
+            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
         case .undetermined:
             publishState("mic permission")
             session.requestRecordPermission { [weak self] granted in
@@ -126,12 +130,12 @@ final class AudioPitchDetector: ObservableObject {
                     self.stateQueue.async { self.configureAndStart() }
                 } else {
                     self.publishState("mic denied")
-                    self.publishSnapshot([], timestamp: CACurrentMediaTime())
+                    self.publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
                 }
             }
         @unknown default:
             publishState("mic unavailable")
-            publishSnapshot([], timestamp: CACurrentMediaTime())
+            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
         }
     }
 
@@ -145,12 +149,11 @@ final class AudioPitchDetector: ObservableObject {
             self.engine.stop()
             self.running = false
             self.resetAudioState()
-            self.publishSnapshot([], timestamp: CACurrentMediaTime())
+            self.publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
             self.publishState("mic off")
         }
     }
 
-    /// Thread-safe read for the render thread.
     func snapshot() -> PitchSnapshot {
         lock.lock()
         defer { lock.unlock() }
@@ -207,7 +210,7 @@ final class AudioPitchDetector: ObservableObject {
             }
             running = false
             publishState("mic error")
-            publishSnapshot([], timestamp: CACurrentMediaTime())
+            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
         }
     }
 
@@ -231,7 +234,7 @@ final class AudioPitchDetector: ObservableObject {
         }
     }
 
-    // MARK: - FFT + note detection
+    // MARK: - Analysis
 
     private func analyze() {
         for i in 0..<fftN {
@@ -240,49 +243,44 @@ final class AudioPitchDetector: ObservableObject {
 
         let rms = rootMeanSquare(frame)
         let now = CACurrentMediaTime()
-        guard rms >= silenceRMS else {
-            updateAmbientNoise(rms: rms, isAttack: false)
-            previousRMS = rms
-            previousTotalEnergy = 0
-            decayForSilence(timestamp: now)
-            return
-        }
 
         for i in 0..<fftN {
             frame[i] *= window[i]
         }
         performFFT()
+        computeSpectrumMagnitude()
+
+        let low = bandStats(fromHz: 30, toHz: 400, weight: 0.85)
+        let mid = bandStats(fromHz: 400, toHz: 2_000, weight: 1.05)
+        let high = bandStats(fromHz: 2_000, toHz: 7_500, weight: 1.55)
+        let onsetScore = low.flux + mid.flux + high.flux
         computeKeyEnergies()
-
-        let floor = noiseFloor()
-        suppressHarmonics(floor: floor)
-        let totalEnergy = energy.reduce(Float(0), +)
-        let strongestEnergy = energy.max() ?? 0
-        let frameAttack = isPianoAttack(
+        let attack = makeAttack(
             rms: rms,
-            totalEnergy: totalEnergy,
-            strongestEnergy: strongestEnergy,
-            floor: floor,
+            onsetScore: onsetScore,
+            lowScore: low.flux,
+            midScore: mid.flux,
+            highScore: high.flux,
             timestamp: now
         )
-        let detected = trackNotes(
-            floor: floor,
-            timestamp: now,
-            allowOnsets: frameAttack
-        )
 
-        updateAmbientNoise(rms: rms, isAttack: frameAttack)
-        previousRMS = rms
-        previousTotalEnergy = totalEnergy
+        let hints = pitchHints(for: attack)
 
-        publishSnapshot(detected, timestamp: now)
+        publishSnapshot(hints: hints, attack: attack, timestamp: now)
         publishUI(
-            detected,
-            floor: floor,
+            hints: hints,
+            attack: attack,
             rms: rms,
-            frameAttack: frameAttack,
+            onsetScore: onsetScore,
+            lowScore: low.flux,
+            midScore: mid.flux,
+            highScore: high.flux,
             timestamp: now
         )
+
+        updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil)
+        prevSpectrum = spectrum
+        hasPreviousSpectrum = true
     }
 
     private func rootMeanSquare(_ values: [Float]) -> Float {
@@ -291,53 +289,6 @@ final class AudioPitchDetector: ObservableObject {
             sum += v * v
         }
         return sqrtf(sum / Float(max(values.count, 1)))
-    }
-
-    private func isPianoAttack(rms: Float,
-                               totalEnergy: Float,
-                               strongestEnergy: Float,
-                               floor: Float,
-                               timestamp: TimeInterval) -> Bool {
-        let noiseGate = max(minAttackRMS, ambientRMS * ambientAttackRatio)
-        let aboveNoise = rms >= noiseGate
-        let rmsJump = previousRMS <= 0
-            ? rms >= minAttackRMS
-            : rms >= previousRMS * rmsAttackRatio
-        let energyJump = previousTotalEnergy <= 0
-            ? totalEnergy > 0
-            : totalEnergy >= previousTotalEnergy * energyAttackRatio
-        let tonalEnough = strongestEnergy >= floor * tonalPeakFloorRatio
-            && strongestEnergy >= totalEnergy * tonalPeakShare
-        let cooledDown = timestamp - lastAttackTime >= minOnsetInterval
-
-        guard aboveNoise, rmsJump, energyJump, tonalEnough, cooledDown else { return false }
-        lastAttackTime = timestamp
-        return true
-    }
-
-    private func updateAmbientNoise(rms: Float, isAttack: Bool) {
-        guard !isAttack else { return }
-        let clamped = min(rms, ambientRMS * 2.0 + 0.0005)
-        ambientRMS = ambientRMS * 0.98 + clamped * 0.02
-    }
-
-    private func decayForSilence(timestamp: TimeInterval) {
-        for i in 0..<88 {
-            energy[i] = 0
-            prevEnergy[i] *= 0.4
-            decayCnt[i] += 1
-            if decayCnt[i] > 2 {
-                active[i] = false
-            }
-        }
-        publishSnapshot([], timestamp: timestamp)
-
-        guard timestamp - lastUI > 0.15 else { return }
-        lastUI = timestamp
-        DispatchQueue.main.async { [weak self] in
-            self?.lastDetected = ""
-            self?.fingerDebugLines = ["rms below gate"]
-        }
     }
 
     private func performFFT() {
@@ -366,11 +317,11 @@ final class AudioPitchDetector: ObservableObject {
                     FFTDirection(kFFTDirection_Forward)
                 )
 
-                self.mag.withUnsafeMutableBufferPointer { mBuf in
+                power.withUnsafeMutableBufferPointer { pBuf in
                     vDSP_zvmags(
                         &split,
                         1,
-                        mBuf.baseAddress!,
+                        pBuf.baseAddress!,
                         1,
                         vDSP_Length(self.fftN / 2)
                     )
@@ -379,162 +330,170 @@ final class AudioPitchDetector: ObservableObject {
         }
     }
 
+    private func computeSpectrumMagnitude() {
+        for i in 0..<power.count {
+            spectrum[i] = sqrtf(max(0, power[i]))
+        }
+    }
+
+    private func bandStats(fromHz: Float, toHz: Float, weight: Float) -> (flux: Float, energy: Float) {
+        let start = max(1, Int((fromHz / binRes).rounded(.down)))
+        let end = min(spectrum.count - 1, Int((toHz / binRes).rounded(.up)))
+        guard end > start else { return (0, 0) }
+
+        var positiveDelta: Float = 0
+        var currentEnergy: Float = 0
+        var previousEnergy: Float = 0
+
+        for i in start...end {
+            let current = spectrum[i]
+            let previous = prevSpectrum[i]
+            currentEnergy += current
+            previousEnergy += previous
+            positiveDelta += max(0, current - previous)
+        }
+
+        let reference = max(previousEnergy, currentEnergy * 0.12, 1e-6)
+        return (positiveDelta / reference * weight, currentEnergy)
+    }
+
+    private func makeAttack(rms: Float,
+                            onsetScore: Float,
+                            lowScore: Float,
+                            midScore: Float,
+                            highScore: Float,
+                            timestamp: TimeInterval) -> AudioAttack? {
+        let rmsGate = max(minRMS, ambientRMS * ambientRMSRatio)
+        let fluxGate = max(minFluxScore, ambientFlux * ambientFluxRatio)
+        let hasHistory = hasPreviousSpectrum
+        let enoughLevel = rms >= rmsGate
+        let enoughChange = onsetScore >= fluxGate
+        let enoughTrebleOrMid = highScore >= fluxGate * 0.18 || midScore >= fluxGate * 0.25
+        let cooledDown = timestamp - lastAttackTime >= minAttackInterval
+
+        guard hasHistory, enoughLevel, enoughChange, enoughTrebleOrMid, cooledDown else {
+            return nil
+        }
+
+        lastAttackTime = timestamp
+        let confidence = min(1.0, max(0.05, onsetScore / max(fluxGate * 2.8, 1e-6)))
+        return AudioAttack(
+            confidence: confidence,
+            onsetScore: onsetScore,
+            lowBandScore: lowScore,
+            midBandScore: midScore,
+            highBandScore: highScore,
+            pitchHintKeyIndex: strongestPitchHintIndex(),
+            timestamp: timestamp
+        )
+    }
+
+    private func updateAmbient(rms: Float, onsetScore: Float, isAttack: Bool) {
+        guard !isAttack else { return }
+        let clampedRMS = min(rms, ambientRMS * 2.0 + 0.0004)
+        let clampedFlux = min(onsetScore, ambientFlux * 2.0 + 0.02)
+        ambientRMS = ambientRMS * 0.985 + clampedRMS * 0.015
+        ambientFlux = ambientFlux * 0.985 + clampedFlux * 0.015
+    }
+
+    // MARK: - Pitch hints for debugging only
+
     private func computeKeyEnergies() {
         let halfN = fftN / 2
         for i in 0..<88 {
             guard i < keyBins.count else {
-                energy[i] = 0
+                keyEnergy[i] = 0
                 continue
             }
 
             let bin = keyBins[i]
             guard bin > 1, bin < halfN - 2 else {
-                energy[i] = 0
+                keyEnergy[i] = 0
                 continue
             }
 
-            var e = mag[bin - 1] + mag[bin] + mag[bin + 1]
-
-            // Acoustic piano fundamentals can be weak, especially in the bass.
-            for (h, w) in [(2, Float(0.42)), (3, Float(0.28)), (4, Float(0.16))] {
+            var e = spectrum[bin - 1] + spectrum[bin] + spectrum[bin + 1]
+            for (h, w) in [(2, Float(0.45)), (3, Float(0.28)), (4, Float(0.15))] {
                 let hb = bin * h
-                guard hb > 0, hb < halfN - 1 else { continue }
-                e += (mag[hb - 1] + mag[hb] + mag[hb + 1]) * w
+                guard hb > 1, hb < halfN - 2 else { continue }
+                e += (spectrum[hb - 1] + spectrum[hb] + spectrum[hb + 1]) * w
             }
 
-            energy[i] = e
+            keyEnergy[i] = e
         }
     }
 
-    private func noiseFloor() -> Float {
-        var sorted = energy
-        sorted.sort()
-        return max(sorted[22] * 3.0, 1e-10)
+    private func strongestPitchHintIndex() -> Int? {
+        guard let maxEnergy = keyEnergy.max(), maxEnergy > 0 else { return nil }
+        return keyEnergy.firstIndex(of: maxEnergy)
     }
 
-    private func suppressHarmonics(floor: Float) {
-        for i in 0..<87 {
-            guard energy[i] > floor else { continue }
-            let freq = Self.keyFreqs[i]
+    private func pitchHints(for attack: AudioAttack?) -> [DetectedNote] {
+        guard let attack else { return [] }
+        let strongest = keyEnergy.max() ?? 0
+        guard strongest > 0 else { return [] }
 
-            for h in 2...6 {
-                let harmonicFreq = freq * Float(h)
-                for j in (i + 1)..<88 {
-                    let candidateFreq = Self.keyFreqs[j]
-                    if candidateFreq > harmonicFreq * 1.03 { break }
-
-                    let cents = fabsf(1200.0 * log2f(harmonicFreq / candidateFreq))
-                    guard cents < 50 else { continue }
-
-                    let expected = energy[i] * (0.3 / Float(h))
-                    if energy[j] < expected * 2.5 {
-                        energy[j] *= 0.05
-                    }
-                }
-            }
-        }
-    }
-
-    private struct NoteCandidate {
-        let index: Int
-        let energy: Float
-        let onset: Bool
-    }
-
-    private func trackNotes(floor: Float,
-                            timestamp: TimeInterval,
-                            allowOnsets: Bool) -> [DetectedNote] {
-        var candidates: [NoteCandidate] = []
-
-        for i in 0..<88 {
-            let e = energy[i]
-            let strong = e > floor * activeFloorRatio
-            let rising = e > max(prevEnergy[i] * onsetRatio, floor * onsetFloorRatio)
-            let onset = allowOnsets
-                && rising
-                && timestamp - lastOnsetTime[i] > minOnsetInterval
-
-            if onset {
-                lastOnsetTime[i] = timestamp
-            }
-
-            if strong && (allowOnsets || active[i]) {
-                decayCnt[i] = 0
-                active[i] = true
-            } else {
-                decayCnt[i] += 1
-                if decayCnt[i] > 4 {
-                    active[i] = false
-                }
-            }
-
-            prevEnergy[i] = e
-
-            if active[i] {
-                candidates.append(NoteCandidate(index: i, energy: e, onset: onset))
-            }
-        }
-
-        guard let strongest = candidates.map(\.energy).max(), strongest > 0 else {
-            return []
-        }
-
-        let publishFloor = max(floor * activeFloorRatio, strongest * 0.08)
-        let filtered = candidates
-            .filter { $0.energy >= publishFloor }
-            .sorted { $0.energy > $1.energy }
-            .prefix(maxPublishedNotes)
-
-        return filtered
-            .sorted { $0.index < $1.index }
-            .map { candidate in
+        let threshold = strongest * 0.20
+        return keyEnergy.enumerated()
+            .filter { $0.element >= threshold }
+            .sorted { $0.element > $1.element }
+            .prefix(maxPitchHints)
+            .map { idx, energy in
                 DetectedNote(
-                    keyIndex: candidate.index,
-                    midiNote: 21 + candidate.index,
-                    magnitude: min(1.0, candidate.energy / max(strongest, 1e-10)),
-                    isOnset: candidate.onset
+                    keyIndex: idx,
+                    midiNote: 21 + idx,
+                    magnitude: min(1.0, energy / strongest),
+                    isOnset: idx == attack.pitchHintKeyIndex
                 )
             }
+            .sorted { $0.keyIndex < $1.keyIndex }
     }
 
     // MARK: - Publishing
 
-    private func publishSnapshot(_ notes: [DetectedNote], timestamp: TimeInterval) {
-        let snap = PitchSnapshot(activeNotes: notes, timestamp: timestamp)
+    private func publishSnapshot(hints: [DetectedNote],
+                                 attack: AudioAttack?,
+                                 timestamp: TimeInterval) {
+        let snap = PitchSnapshot(activeNotes: hints, attack: attack, timestamp: timestamp)
         lock.lock()
         _snap = snap
         lock.unlock()
     }
 
-    private func publishUI(_ notes: [DetectedNote],
-                           floor: Float,
+    private func publishUI(hints: [DetectedNote],
+                           attack: AudioAttack?,
                            rms: Float,
-                           frameAttack: Bool,
+                           onsetScore: Float,
+                           lowScore: Float,
+                           midScore: Float,
+                           highScore: Float,
                            timestamp: TimeInterval) {
         guard timestamp - lastUI > 0.08 else { return }
         lastUI = timestamp
 
-        let onsets = notes
-            .filter(\.isOnset)
-            .map { KeyboardLayout.keys[$0.keyIndex].noteName }
-        let label = onsets.joined(separator: " ")
-
-        var dbg = notes.prefix(10).map { note -> String in
+        let hintText = hints.map { note -> String in
             let name = KeyboardLayout.keys[note.keyIndex].noteName
-            let magText = String(format: "%.2f", note.magnitude)
-            return "\(name) \(magText)\(note.isOnset ? " ON" : "")"
+            return "\(name):\(String(format: "%.2f", note.magnitude))"
+        }.joined(separator: " ")
+
+        var debug: [String] = []
+        let label: String
+        if let attack {
+            label = "attack"
+            debug.append(String(format: "ATTACK conf %.2f score %.2f", attack.confidence, attack.onsetScore))
+        } else {
+            label = ""
+            debug.append(String(format: "score %.2f gate %.2f", onsetScore, max(minFluxScore, ambientFlux * ambientFluxRatio)))
         }
-        dbg.append(String(
-            format: "rms %.4f amb %.4f floor %.2e%@",
-            rms,
-            ambientRMS,
-            floor,
-            frameAttack ? " ATTACK" : ""
-        ))
+        debug.append(String(format: "rms %.4f amb %.4f", rms, ambientRMS))
+        debug.append(String(format: "bands L %.2f M %.2f H %.2f", lowScore, midScore, highScore))
+        if !hintText.isEmpty {
+            debug.append("pitch hint \(hintText)")
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.lastDetected = label
-            self?.fingerDebugLines = dbg
+            self?.fingerDebugLines = debug
         }
     }
 
@@ -547,17 +506,15 @@ final class AudioPitchDetector: ObservableObject {
     private func resetAudioState() {
         ring = .init(repeating: 0, count: fftN)
         frame = .init(repeating: 0, count: fftN)
-        mag = .init(repeating: 0, count: fftN / 2)
+        power = .init(repeating: 0, count: fftN / 2)
+        spectrum = .init(repeating: 0, count: fftN / 2)
+        prevSpectrum = .init(repeating: 0, count: fftN / 2)
+        keyEnergy = .init(repeating: 0, count: 88)
         ringW = 0
         hopAcc = 0
-        energy = .init(repeating: 0, count: 88)
-        prevEnergy = .init(repeating: 0, count: 88)
-        active = .init(repeating: false, count: 88)
-        decayCnt = .init(repeating: 0, count: 88)
-        lastOnsetTime = .init(repeating: 0, count: 88)
         ambientRMS = 0.002
-        previousRMS = 0
-        previousTotalEnergy = 0
+        ambientFlux = 0.08
         lastAttackTime = 0
+        hasPreviousSpectrum = false
     }
 }
