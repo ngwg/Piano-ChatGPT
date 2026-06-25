@@ -1,5 +1,6 @@
 import ARKit
 import Vision
+import CoreImage
 import simd
 
 final class HandTracker: ObservableObject {
@@ -28,26 +29,32 @@ final class HandTracker: ObservableObject {
         (5,9),(9,13),(13,17),
     ]
 
-    // Palm-adjacent bones get thicker strokes in the overlay
     static let isPalmBone: Set<Int> = [4, 8, 12, 16, 20, 21, 22]
 
     private var _hands: [HandResult] = []
     private let lock         = NSLock()
     private var isProcessing = false
-    private var frameCount   = 0
+    // No frame-count gate — process as fast as Vision allows; isProcessing prevents queuing.
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
     private var smoothed:    [String: SIMD3<Float>] = [:]
+
+    // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
+    private var scaledBuf:  CVPixelBuffer?
+    private var scaledSize: CGSize = .zero
+    // GPU-backed CIContext for fast rescaling. Only ever touched on visionQueue (serial).
+    private lazy var ciCtx = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .workingColorSpace: NSNull(),
+    ])
 
     // MARK: - Public
 
     func maybeProcess(_ frame: ARFrame) {
-        frameCount += 1
-        guard frameCount % 2 == 0, !isProcessing else { return }
+        guard !isProcessing else { return }
         isProcessing = true
 
         let pixelBuffer = frame.capturedImage
         let camera      = frame.camera
-        // Prefer smoothed depth (fewer holes); fall back to raw sceneDepth.
         let depthMap    = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
 
         visionQueue.async { [weak self] in
@@ -65,13 +72,16 @@ final class HandTracker: ObservableObject {
     private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, depthMap: CVPixelBuffer?) {
         defer { isProcessing = false }
 
+        // Downscale to ≤640 px on the long side before Vision.
+        // At 1920×1440 input that's ~3× linear = ~9× fewer pixels → dramatically faster ML.
+        // Vision's normalized [0,1] output is resolution-independent, so depth/3D math
+        // below still uses the original camera.imageResolution.
+        let visionInput = downscaled(pixelBuffer, maxSide: 640)
+
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 2
 
-        // .up = no rotation: Vision returns raw landscape image coords (y-up, bottom-left).
-        // We convert to camera pixel space ourselves so we can sample the LiDAR depth map
-        // at the exact pixel, then unproject via camera intrinsics for a correct 3D position.
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
+        let handler = VNImageRequestHandler(cvPixelBuffer: visionInput,
                                             orientation: .up, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
@@ -82,27 +92,36 @@ final class HandTracker: ObservableObject {
         var results: [HandResult] = []
 
         for obs in observations {
-            let side  = obs.chirality == .left ? "L" : "R"
+            let side = obs.chirality == .left ? "L" : "R"
             var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
 
             for name in HandTracker.allJoints {
-                guard let pt = try? obs.recognizedPoint(name), pt.confidence > 0.2 else { continue }
+                guard let pt = try? obs.recognizedPoint(name),
+                      pt.confidence > 0.15 else { continue }
 
-                // Vision (y-up, bottom-left) → camera image pixel (y-down, top-left).
+                // Vision (y-up, bottom-left) → camera image pixel (y-down, top-left)
                 let px = Float(pt.location.x) * imgW
                 let py = (1.0 - Float(pt.location.y)) * imgH
 
-                // Sample LiDAR depth at this pixel; fall back to 0.4 m if unavailable.
                 let depth = depthMap.flatMap {
                     sampleDepth(from: $0, px: px, py: py, imgW: imgW, imgH: imgH)
                 } ?? 0.4
 
-                // Compute world-space position via camera intrinsics (no plane assumption).
                 let world = cameraPixelToWorld(px: px, py: py, depth: depth, camera: camera)
 
-                // EMA smoothing (α = 0.4).
+                // Adaptive EMA: fast-follow when the hand moves, heavy-smooth when still.
+                // This eliminates lag on fast gestures while suppressing jitter at rest —
+                // critical for the gesture UI in Phase 6.
                 let key = "\(side)_\(name.rawValue)"
-                let s   = smoothed[key].map { $0 + 0.4 * (world - $0) } ?? world
+                let s: SIMD3<Float>
+                if let prev = smoothed[key] {
+                    let dist  = simd_length(world - prev)
+                    // α ≈ 0.2 for < 3 mm/frame movement, ramps to 0.95 at > 4 cm/frame
+                    let alpha = simd_clamp(dist / 0.04, 0.2, 0.95)
+                    s = prev + alpha * (world - prev)
+                } else {
+                    s = world
+                }
                 smoothed[key] = s
                 joints[name]  = s
             }
@@ -113,6 +132,39 @@ final class HandTracker: ObservableObject {
         }
 
         commit(results, count: observations.count)
+    }
+
+    // MARK: - Downscaling
+
+    private func downscaled(_ src: CVPixelBuffer, maxSide: Int) -> CVPixelBuffer {
+        let w = CVPixelBufferGetWidth(src)
+        let h = CVPixelBufferGetHeight(src)
+        guard max(w, h) > maxSide else { return src }
+
+        let scale = CGFloat(maxSide) / CGFloat(max(w, h))
+        let dw    = max(1, Int(CGFloat(w) * scale))
+        let dh    = max(1, Int(CGFloat(h) * scale))
+        let sz    = CGSize(width: dw, height: dh)
+
+        if scaledBuf == nil || scaledSize != sz {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+                kCVPixelBufferMetalCompatibilityKey:  true,
+            ]
+            scaledBuf  = nil
+            CVPixelBufferCreate(kCFAllocatorDefault, dw, dh,
+                                kCVPixelFormatType_32BGRA,
+                                attrs as CFDictionary, &scaledBuf)
+            scaledSize = sz
+        }
+        guard let dst = scaledBuf else { return src }
+
+        let ci     = CIImage(cvPixelBuffer: src)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        ciCtx.render(scaled, to: dst,
+                     bounds: CGRect(origin: .zero, size: sz),
+                     colorSpace: nil)
+        return dst
     }
 
     // MARK: - Helpers
@@ -129,26 +181,18 @@ final class HandTracker: ObservableObject {
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
 
         guard let base = CVPixelBufferGetBaseAddress(map) else { return nil }
-        let bpr = CVPixelBufferGetBytesPerRow(map)
-        let val  = base.assumingMemoryBound(to: Float32.self)[dy * (bpr / 4) + dx]
+        let val = base.assumingMemoryBound(to: Float32.self)[dy * (CVPixelBufferGetBytesPerRow(map) / 4) + dx]
         return (val > 0.05 && val < 5.0 && val.isFinite) ? val : nil
     }
 
-    /// Converts a camera-image pixel + LiDAR depth to an ARKit world-space position.
-    /// ARKit camera: right-handed, looks along -Z, Y is up.
-    /// Image coords: x-right, y-down (top-left origin).
+    // ARKit camera: right-hand coords, looks along -Z, Y up. Image: x-right, y-down.
     private func cameraPixelToWorld(px: Float, py: Float,
                                      depth: Float, camera: ARCamera) -> SIMD3<Float> {
-        let fx = camera.intrinsics[0][0]
-        let fy = camera.intrinsics[1][1]
-        let cx = camera.intrinsics[2][0]
-        let cy = camera.intrinsics[2][1]
-
-        let xc =  (px - cx) / fx * depth   // camera x (right)
-        let yc = -(py - cy) / fy * depth   // flip: image y-down → camera y-up
-        let zc = -depth                    // scene is at negative z in camera space
-
-        let w = camera.transform * SIMD4<Float>(xc, yc, zc, 1.0)
+        let fx = camera.intrinsics[0][0];  let fy = camera.intrinsics[1][1]
+        let cx = camera.intrinsics[2][0];  let cy = camera.intrinsics[2][1]
+        let w  = camera.transform * SIMD4<Float>( (px-cx)/fx*depth,
+                                                 -(py-cy)/fy*depth,
+                                                  -depth, 1)
         return SIMD3<Float>(w.x, w.y, w.z)
     }
 
