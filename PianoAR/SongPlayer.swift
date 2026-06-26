@@ -11,6 +11,8 @@ enum PracticePressResult {
 final class SongPlayer: ObservableObject {
     @Published var isPlaying = false
     @Published var feedbackLine = ""
+    @Published var chordLine = ""
+    @Published var scoreLine = ""
 
     // Set once at load/play, stable during playback.
     // Render thread reads these without a lock — benign on ARM64
@@ -25,6 +27,12 @@ final class SongPlayer: ObservableObject {
     private(set) var mistakeCount:  Int      = 0
     private(set) var guidedMode:    Bool     = true
     private(set) var acceptedGroupKeyIndices: Set<Int> = []
+    private(set) var retryCount: Int = 0
+    private(set) var currentStreak: Int = 0
+    private(set) var bestStreak: Int = 0
+    private(set) var lastTimingMs: Double = 0
+    private(set) var timingSampleCount: Int = 0
+    private(set) var totalAbsTimingMs: Double = 0
 
     // Pre-built lookup so the render thread never allocates.
     private(set) var midiToKeyIndex: [Int: Int] = [:]
@@ -46,7 +54,10 @@ final class SongPlayer: ObservableObject {
         acceptedCount = 0
         mistakeCount  = 0
         acceptedGroupKeyIndices.removeAll()
+        resetScore()
         feedbackLine  = "Ready: \(song.title ?? "Practice")"
+        chordLine = currentChordStatusText()
+        updateScoreLine()
     }
 
     func play() {
@@ -55,14 +66,18 @@ final class SongPlayer: ObservableObject {
         acceptedCount = 0
         mistakeCount  = 0
         acceptedGroupKeyIndices.removeAll()
+        resetScore()
         startHostTime = CACurrentMediaTime() + countInBeats * 60.0 / bpm
         isPlaying     = true
         feedbackLine  = nextPrompt(prefix: "Get ready")
+        chordLine = currentChordStatusText()
+        updateScoreLine()
     }
 
     func stop() {
         isPlaying = false
         feedbackLine = "Stopped"
+        updateScoreLine()
     }
 
     func restart() {
@@ -104,8 +119,12 @@ final class SongPlayer: ObservableObject {
         let expectedName = promptFor(group: group, excluding: acceptedGroupKeyIndices)
         guard expectedKeyIndices.contains(keyIndex) else {
             mistakeCount += 1
+            retryCount += 1
+            currentStreak = 0
+            updateScoreLine()
             DispatchQueue.main.async { [weak self] in
                 self?.feedbackLine = "Try \(expectedName) again"
+                self?.chordLine = self?.currentChordStatusText() ?? ""
             }
             return .wrong(
                 playedKeyIndex: keyIndex,
@@ -121,6 +140,12 @@ final class SongPlayer: ObservableObject {
 
         acceptedGroupKeyIndices.insert(keyIndex)
         acceptedCount += 1
+        currentStreak += 1
+        bestStreak = max(bestStreak, currentStreak)
+        let timingMs = currentTimingMs(forBeat: notes[expectedIndex].startBeat)
+        lastTimingMs = timingMs
+        totalAbsTimingMs += abs(timingMs)
+        timingSampleCount += 1
         let acceptedNoteName = group.first { item in item.keyIndex == keyIndex }?.note.key ?? noteName
 
         let groupComplete = expectedKeyIndices.isSubset(of: acceptedGroupKeyIndices)
@@ -135,6 +160,8 @@ final class SongPlayer: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.isPlaying = false
                 self?.feedbackLine = "Complete: \(self?.acceptedCount ?? 0) notes"
+                self?.chordLine = "Chord: done"
+                self?.updateScoreLine()
             }
         } else {
             let prompt: String
@@ -146,6 +173,8 @@ final class SongPlayer: ObservableObject {
             }
             DispatchQueue.main.async { [weak self] in
                 self?.feedbackLine = prompt
+                self?.chordLine = self?.currentChordStatusText() ?? ""
+                self?.updateScoreLine()
             }
         }
 
@@ -208,5 +237,43 @@ final class SongPlayer: ObservableObject {
             return item.note.key
         }
         return names.isEmpty ? "done" : names.joined(separator: " + ")
+    }
+
+    private func currentChordStatusText() -> String {
+        let group = currentExpectedGroup()
+        guard !group.isEmpty else { return "" }
+
+        let parts = group.map { item -> String in
+            let accepted = item.keyIndex.map { acceptedGroupKeyIndices.contains($0) } ?? false
+            let marker = accepted ? "[x]" : "[ ]"
+            return "\(marker) \(item.note.key)"
+        }
+        return group.count > 1
+            ? "Chord: \(parts.joined(separator: "  "))"
+            : "Next: \(parts.joined())"
+    }
+
+    private func currentTimingMs(forBeat beat: Double) -> Double {
+        let currentBeat = (CACurrentMediaTime() - startHostTime) * bpm / 60.0
+        return (currentBeat - beat) * 60.0 / bpm * 1000.0
+    }
+
+    private func resetScore() {
+        retryCount = 0
+        currentStreak = 0
+        bestStreak = 0
+        lastTimingMs = 0
+        timingSampleCount = 0
+        totalAbsTimingMs = 0
+    }
+
+    private func updateScoreLine() {
+        let average = timingSampleCount > 0 ? totalAbsTimingMs / Double(timingSampleCount) : 0
+        let last = Int(lastTimingMs.rounded())
+        let avg = Int(average.rounded())
+        let line = "Score: \(acceptedCount) ok  \(retryCount) retries  streak \(currentStreak)/\(bestStreak)  last \(last)ms avg \(avg)ms"
+        DispatchQueue.main.async { [weak self] in
+            self?.scoreLine = line
+        }
     }
 }

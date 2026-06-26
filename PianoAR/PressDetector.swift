@@ -63,7 +63,8 @@ final class PressDetector: ObservableObject {
                 keyboardNode: SCNNode?,
                 time: TimeInterval,
                 audioSnapshot: PitchSnapshot? = nil,
-                expectedKeyIndices: Set<Int> = []) -> [PressEvent] {
+                expectedKeyIndices: Set<Int> = [],
+                keyTuning: KeyTuning? = nil) -> [PressEvent] {
         guard let kb = keyboardNode else { return [] }
 
         var newPresses: [PressEvent] = []
@@ -92,16 +93,18 @@ final class PressDetector: ObservableObject {
                 }
 
                 // Which key is this finger over?
-                let key = findKey(localX: local.x, localZ: local.z)
+                let key = findKey(localX: local.x, localZ: local.z, keyTuning: keyTuning)
                 let guidedKey = expectedGuidedKey(
                     localX: local.x,
                     localZ: local.z,
-                    expectedKeyIndices: expectedKeyIndices
+                    expectedKeyIndices: expectedKeyIndices,
+                    keyTuning: keyTuning
                 ) ?? findKey(
                     localX: local.x,
                     localZ: local.z,
                     extraX: guidedKeyXTolerance,
-                    extraZ: guidedKeyZTolerance
+                    extraZ: guidedKeyZTolerance,
+                    keyTuning: keyTuning
                 )
                 let micBoost = key.map {
                     audioBoost(
@@ -243,7 +246,8 @@ final class PressDetector: ObservableObject {
     private func findKey(localX: Float,
                          localZ: Float,
                          extraX: Float = 0.004,
-                         extraZ: Float = 0.018) -> KeyboardLayout.Key? {
+                         extraZ: Float = 0.018,
+                         keyTuning: KeyTuning? = nil) -> KeyboardLayout.Key? {
         let leftEdge = -KeyboardLayout.totalWidth / 2
         let relX = localX - leftEdge
         guard relX >= -extraX, relX <= KeyboardLayout.totalWidth + extraX else { return nil }
@@ -259,8 +263,16 @@ final class PressDetector: ObservableObject {
         if localZ >= blackZMin, localZ <= blackZMax {
             let halfW = KeyboardLayout.blackKeyWidth / 2 + extraX
             let black = KeyboardLayout.keys
-                .filter { $0.isBlack && abs(relX - $0.xCenter) < halfW }
-                .min { abs(relX - $0.xCenter) < abs(relX - $1.xCenter) }
+                .filter {
+                    guard $0.isBlack else { return false }
+                    let center = tunedXCenter(for: $0, keyTuning: keyTuning)
+                    let tunedHalfW = halfW + tunedWidthExtra(for: $0, keyTuning: keyTuning)
+                    return abs(relX - center) < tunedHalfW
+                }
+                .min {
+                    abs(relX - tunedXCenter(for: $0, keyTuning: keyTuning))
+                        < abs(relX - tunedXCenter(for: $1, keyTuning: keyTuning))
+                }
             if let black {
                 return black
             }
@@ -268,13 +280,22 @@ final class PressDetector: ObservableObject {
 
         let halfW = KeyboardLayout.whiteKeyWidth / 2 + extraX
         return KeyboardLayout.keys
-            .filter { !$0.isBlack && abs(relX - $0.xCenter) < halfW }
-            .min { abs(relX - $0.xCenter) < abs(relX - $1.xCenter) }
+            .filter {
+                guard !$0.isBlack else { return false }
+                let center = tunedXCenter(for: $0, keyTuning: keyTuning)
+                let tunedHalfW = halfW + tunedWidthExtra(for: $0, keyTuning: keyTuning)
+                return abs(relX - center) < tunedHalfW
+            }
+            .min {
+                abs(relX - tunedXCenter(for: $0, keyTuning: keyTuning))
+                    < abs(relX - tunedXCenter(for: $1, keyTuning: keyTuning))
+            }
     }
 
     private func expectedGuidedKey(localX: Float,
                                    localZ: Float,
-                                   expectedKeyIndices: Set<Int>) -> KeyboardLayout.Key? {
+                                   expectedKeyIndices: Set<Int>,
+                                   keyTuning: KeyTuning? = nil) -> KeyboardLayout.Key? {
         guard !expectedKeyIndices.isEmpty else { return nil }
 
         let leftEdge = -KeyboardLayout.totalWidth / 2
@@ -287,9 +308,12 @@ final class PressDetector: ObservableObject {
 
             if key.isBlack {
                 let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
-                let halfX = KeyboardLayout.blackKeyWidth / 2 + guidedKeyXTolerance
+                let center = tunedXCenter(for: key, keyTuning: keyTuning)
+                let halfX = KeyboardLayout.blackKeyWidth / 2
+                    + guidedKeyXTolerance
+                    + tunedWidthExtra(for: key, keyTuning: keyTuning)
                 let halfZ = KeyboardLayout.blackKeyDepth / 2 + guidedKeyZTolerance
-                let dx = abs(relX - key.xCenter)
+                let dx = abs(relX - center)
                 let dz = abs(localZ - blackZCenter)
                 guard dx <= halfX, dz <= halfZ else { continue }
                 let score = 1.0 - min(1.0, dx / halfX) * 0.70 - min(1.0, dz / halfZ) * 0.30
@@ -297,9 +321,12 @@ final class PressDetector: ObservableObject {
                     best = (key, score)
                 }
             } else {
-                let halfX = KeyboardLayout.whiteKeyWidth / 2 + 0.008
+                let center = tunedXCenter(for: key, keyTuning: keyTuning)
+                let halfX = KeyboardLayout.whiteKeyWidth / 2
+                    + 0.008
+                    + tunedWidthExtra(for: key, keyTuning: keyTuning)
                 let halfZ = KeyboardLayout.whiteKeyDepth / 2 + guidedKeyZTolerance
-                let dx = abs(relX - key.xCenter)
+                let dx = abs(relX - center)
                 let dz = abs(localZ)
                 guard dx <= halfX, dz <= halfZ else { continue }
                 let score = 1.0 - min(1.0, dx / halfX) * 0.78 - min(1.0, dz / halfZ) * 0.22
@@ -310,6 +337,16 @@ final class PressDetector: ObservableObject {
         }
 
         return best?.key
+    }
+
+    private func tunedXCenter(for key: KeyboardLayout.Key,
+                              keyTuning: KeyTuning?) -> Float {
+        key.xCenter + (keyTuning?.xOffset(for: key.index) ?? 0)
+    }
+
+    private func tunedWidthExtra(for key: KeyboardLayout.Key,
+                                 keyTuning: KeyTuning?) -> Float {
+        Swift.max(-0.008, keyTuning?.widthExtra(for: key.index) ?? 0)
     }
 
     private func makeGuidedCandidate(key: KeyboardLayout.Key?,

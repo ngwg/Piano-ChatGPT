@@ -10,12 +10,14 @@ struct ARPassthroughView: UIViewRepresentable {
     let songPlayer:    SongPlayer
     let pressDetector: PressDetector
     let audioDetector: AudioPitchDetector
+    let keyTuning:     KeyTuning
     let onTap:         (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
                     pressDetector: pressDetector, audioDetector: audioDetector,
+                    keyTuning: keyTuning,
                     onTap: onTap)
     }
 
@@ -45,6 +47,7 @@ struct ARPassthroughView: UIViewRepresentable {
         context.coordinator.songPlayer     = songPlayer
         context.coordinator.pressDetector  = pressDetector
         context.coordinator.audioDetector  = audioDetector
+        context.coordinator.keyTuning      = keyTuning
     }
 
     // MARK: - Coordinator
@@ -56,6 +59,7 @@ struct ARPassthroughView: UIViewRepresentable {
         var songPlayer:    SongPlayer
         var pressDetector: PressDetector
         var audioDetector: AudioPitchDetector
+        var keyTuning:     KeyTuning
         var onTap: (CGPoint) -> Void
 
         private var hand3D:  Hand3DOverlay?
@@ -65,6 +69,7 @@ struct ARPassthroughView: UIViewRepresentable {
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
              pressDetector: PressDetector, audioDetector: AudioPitchDetector,
+             keyTuning: KeyTuning,
              onTap: @escaping (CGPoint) -> Void) {
             self.placement     = placement
             self.calibration   = calibration
@@ -72,6 +77,7 @@ struct ARPassthroughView: UIViewRepresentable {
             self.songPlayer    = songPlayer
             self.pressDetector = pressDetector
             self.audioDetector = audioDetector
+            self.keyTuning     = keyTuning
             self.onTap         = onTap
         }
 
@@ -102,7 +108,8 @@ struct ARPassthroughView: UIViewRepresentable {
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
                 audioSnapshot: audio,
-                expectedKeyIndices: expectedKeyIndices
+                expectedKeyIndices: expectedKeyIndices,
+                keyTuning: keyTuning
             )
             for p in presses {
                 switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName) {
