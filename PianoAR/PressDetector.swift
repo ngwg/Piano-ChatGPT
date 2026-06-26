@@ -50,7 +50,8 @@ final class PressDetector: ObservableObject {
     func update(hands: [HandTracker.HandResult],
                 keyboardNode: SCNNode?,
                 time: TimeInterval,
-                audioSnapshot: PitchSnapshot? = nil) -> [PressEvent] {
+                audioSnapshot: PitchSnapshot? = nil,
+                expectedKeyIndex: Int? = nil) -> [PressEvent] {
         guard let kb = keyboardNode else { return [] }
 
         var newPresses: [PressEvent] = []
@@ -79,7 +80,12 @@ final class PressDetector: ObservableObject {
                 // Which key is this finger over?
                 let key = findKey(localX: local.x, localZ: local.z)
                 let micBoost = key.map {
-                    audioBoost(for: $0.index, snapshot: audioSnapshot, time: time)
+                    audioBoost(
+                        for: $0.index,
+                        snapshot: audioSnapshot,
+                        time: time,
+                        expectedKeyIndex: expectedKeyIndex
+                    )
                 } ?? 0
                 let surfaceY: Float = (key?.isBlack == true)
                     ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
@@ -211,14 +217,25 @@ final class PressDetector: ObservableObject {
         return nil
     }
 
-    private func audioBoost(for _: Int,
+    private func audioBoost(for keyIndex: Int,
                             snapshot: PitchSnapshot?,
-                            time: TimeInterval) -> Float {
+                            time: TimeInterval,
+                            expectedKeyIndex: Int?) -> Float {
         guard let snapshot,
               let attack = snapshot.attack,
               abs(time - attack.timestamp) <= 0.12
         else { return 0 }
 
-        return 0.10 + attack.confidence * 0.16
+        if let expectedKeyIndex, expectedKeyIndex != keyIndex {
+            return 0
+        }
+
+        let pitchMatchesExpected = snapshot.activeNotes.contains {
+            abs($0.keyIndex - keyIndex) <= 1
+        }
+        if pitchMatchesExpected {
+            return 0.16 + attack.confidence * 0.18
+        }
+        return 0.06 + attack.confidence * 0.10
     }
 }

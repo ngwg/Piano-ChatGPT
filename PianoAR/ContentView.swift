@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum AppMode { case virtualPiano, realPiano }
 
@@ -12,6 +13,7 @@ struct ContentView: View {
     @StateObject private var audioDetector = AudioPitchDetector()
     @State       private var mode: AppMode = .virtualPiano
     @State       private var showDebug = false
+    @State       private var showMIDIImporter = false
 
     var body: some View {
         ZStack {
@@ -30,17 +32,23 @@ struct ContentView: View {
             VStack {
                 topBar
                 Spacer()
-                if !pressDetector.lastDetected.isEmpty || !audioDetector.lastDetected.isEmpty {
+                if !detectionText.isEmpty {
                     detectedNoteLabel
                 }
-                playButton
+                songControls
                 bottomInstructions
             }
             if showDebug { debugOverlay }
         }
         .background(Color.black)
         .onAppear {
-            if let song = Song.load(named: "sample_song") {
+            let bundledSong = MIDIFileImporter.loadBundled(
+                named: "right_hand_practice",
+                title: "Right Hand Primer"
+            )
+            let fallbackSong = Song.load(named: "right_hand_practice")
+                ?? Song.load(named: "sample_song")
+            if let song = bundledSong ?? fallbackSong {
                 songPlayer.load(song)
             }
             audioDetector.start()
@@ -48,6 +56,19 @@ struct ContentView: View {
         .onDisappear {
             audioDetector.stop()
         }
+        .fileImporter(
+            isPresented: $showMIDIImporter,
+            allowedContentTypes: Self.midiTypes,
+            allowsMultipleSelection: false,
+            onCompletion: importMIDI
+        )
+    }
+
+    private static var midiTypes: [UTType] {
+        [
+            UTType(filenameExtension: "mid") ?? .data,
+            UTType(filenameExtension: "midi") ?? .data,
+        ]
     }
 
     // MARK: Detected note label
@@ -64,32 +85,72 @@ struct ContentView: View {
     }
 
     private var detectionText: String {
+        if !songPlayer.feedbackLine.isEmpty {
+            return songPlayer.feedbackLine
+        }
         if !pressDetector.lastDetected.isEmpty {
             return "Vision \(pressDetector.lastDetected)"
         }
-        return "Mic \(audioDetector.lastDetected)"
+        if !audioDetector.lastDetected.isEmpty {
+            return "Mic \(audioDetector.lastDetected)"
+        }
+        return ""
     }
 
-    // MARK: Play button
+    // MARK: Song controls
 
-    private var playButton: some View {
-        Button {
-            if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: songPlayer.isPlaying ? "stop.fill" : "play.fill")
-                Text(songPlayer.isPlaying ? "Stop" : "Play Song")
-                    .font(.caption.bold())
+    private var songControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: songPlayer.isPlaying ? "stop.fill" : "play.fill")
+                    Text(songPlayer.isPlaying ? "Stop" : "Practice")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 9)
+                .background(songPlayer.isPlaying
+                    ? Color.red.opacity(0.75)
+                    : Color(red: 0.1, green: 0.5, blue: 0.9).opacity(0.85))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
-            .background(songPlayer.isPlaying
-                ? Color.red.opacity(0.75)
-                : Color(red: 0.1, green: 0.5, blue: 0.9).opacity(0.85))
-            .foregroundStyle(.white)
-            .cornerRadius(10)
+
+            Button {
+                showMIDIImporter = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.and.arrow.down")
+                    Text("MIDI")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(Color.white.opacity(0.16))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
+            }
         }
         .padding(.bottom, 8)
+    }
+
+    private func importMIDI(_ result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let access = url.startAccessingSecurityScopedResource()
+            defer {
+                if access { url.stopAccessingSecurityScopedResource() }
+            }
+
+            let data = try Data(contentsOf: url)
+            let title = url.deletingPathExtension().lastPathComponent
+            let song = try MIDIFileImporter.song(from: data, title: title)
+            songPlayer.load(song)
+        } catch {
+            songPlayer.feedbackLine = error.localizedDescription
+        }
     }
 
     // MARK: Top bar
@@ -98,7 +159,7 @@ struct ContentView: View {
         HStack(alignment: .top) {
             HUDPanel(session: session, placement: placement,
                      calibration: calibration, handTracker: handTracker,
-                     audioDetector: audioDetector, mode: mode)
+                     songPlayer: songPlayer, audioDetector: audioDetector, mode: mode)
                 .padding(12)
             Spacer()
             VStack(spacing: 8) {
@@ -248,6 +309,7 @@ private struct HUDPanel: View {
     @ObservedObject var placement:   PlacementManager
     @ObservedObject var calibration: CalibrationManager
     @ObservedObject var handTracker: HandTracker
+    @ObservedObject var songPlayer: SongPlayer
     @ObservedObject var audioDetector: AudioPitchDetector
     let mode: AppMode
 
@@ -267,6 +329,8 @@ private struct HUDPanel: View {
             Text("Mic: \(audioDetector.microphoneState)")
                 .font(.caption2)
                 .foregroundStyle(audioDetector.microphoneState == "mic listening" ? .green : .secondary)
+            Text("Lesson: \(songPlayer.acceptedCount)/\(songPlayer.notes.count)  Misses: \(songPlayer.mistakeCount)")
+                .font(.caption2)
         }
         .padding(8)
         .background(.black.opacity(0.55))

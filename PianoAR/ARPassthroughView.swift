@@ -95,15 +95,24 @@ struct ARPassthroughView: UIViewRepresentable {
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
             let audio = audioDetector.snapshot()
+            let expectedKeyIndex = songPlayer.expectedKeyIndexNow()
             hand3D?.update(hands: hands)
 
             // Press detection: fingertip depth vs. keyboard surface
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
-                audioSnapshot: audio
+                audioSnapshot: audio,
+                expectedKeyIndex: expectedKeyIndex
             )
             for p in presses {
-                highway?.registerPress(keyIndex: p.keyIndex)
+                switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName) {
+                case .correct(let expectedKeyIndex, _):
+                    highway?.registerPress(keyIndex: expectedKeyIndex)
+                case .wrong(let playedKeyIndex, _, _, _):
+                    highway?.registerMiss(keyIndex: playedKeyIndex)
+                case .ignored:
+                    highway?.registerPress(keyIndex: p.keyIndex)
+                }
             }
 
             highway?.update(player: songPlayer)

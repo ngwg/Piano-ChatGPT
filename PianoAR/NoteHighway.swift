@@ -119,6 +119,17 @@ final class NoteHighway {
         return m
     }()
 
+    private static let matMissFlash: SCNMaterial = {
+        let m = SCNMaterial()
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 1.0, green: 0.12, blue: 0.12, alpha: 1)
+        m.emission.contents   = UIColor(red: 0.75, green: 0.02, blue: 0.02, alpha: 1)
+        m.blendMode           = .add
+        m.isDoubleSided       = true
+        m.writesToDepthBuffer = false
+        return m
+    }()
+
     private static let matLabel: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel      = .constant
@@ -136,6 +147,7 @@ final class NoteHighway {
     private var barNoteKeys:    [String]   = []   // tracks last text set on each label
     private var highlights:     [SCNNode?] = Array(repeating: nil, count: 88)
     private var pressFlashes:  [Int: TimeInterval] = [:]
+    private var missFlashes:   [Int: TimeInterval] = [:]
     private let midiToKey: [Int: KeyboardLayout.Key]
 
     // MARK: - Init
@@ -291,6 +303,10 @@ final class NoteHighway {
         pressFlashes[keyIndex] = CACurrentMediaTime()
     }
 
+    func registerMiss(keyIndex: Int) {
+        missFlashes[keyIndex] = CACurrentMediaTime()
+    }
+
     // MARK: - Per-frame update (called from renderer(_:updateAtTime:) on render thread)
 
     func update(player: SongPlayer) {
@@ -394,5 +410,18 @@ final class NoteHighway {
             hl.isHidden = false
         }
         for k in expired { pressFlashes.removeValue(forKey: k) }
+
+        expired.removeAll()
+        for (keyIndex, startTime) in missFlashes {
+            let elapsed = now - startTime
+            if elapsed > 0.35 {
+                expired.append(keyIndex)
+                continue
+            }
+            guard keyIndex < 88, let hl = highlights[keyIndex] else { continue }
+            hl.geometry?.materials = [Self.matMissFlash]
+            hl.isHidden = false
+        }
+        for k in expired { missFlashes.removeValue(forKey: k) }
     }
 }
