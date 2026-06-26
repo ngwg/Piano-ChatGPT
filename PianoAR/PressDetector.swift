@@ -93,7 +93,11 @@ final class PressDetector: ObservableObject {
 
                 // Which key is this finger over?
                 let key = findKey(localX: local.x, localZ: local.z)
-                let guidedKey = findKey(
+                let guidedKey = expectedGuidedKey(
+                    localX: local.x,
+                    localZ: local.z,
+                    expectedKeyIndex: expectedKeyIndex
+                ) ?? findKey(
                     localX: local.x,
                     localZ: local.z,
                     extraX: guidedKeyXTolerance,
@@ -267,6 +271,36 @@ final class PressDetector: ObservableObject {
         return KeyboardLayout.keys
             .filter { !$0.isBlack && abs(relX - $0.xCenter) < halfW }
             .min { abs(relX - $0.xCenter) < abs(relX - $1.xCenter) }
+    }
+
+    private func expectedGuidedKey(localX: Float,
+                                   localZ: Float,
+                                   expectedKeyIndex: Int?) -> KeyboardLayout.Key? {
+        guard let expectedKeyIndex,
+              expectedKeyIndex >= 0,
+              expectedKeyIndex < KeyboardLayout.keys.count
+        else { return nil }
+
+        let key = KeyboardLayout.keys[expectedKeyIndex]
+        let leftEdge = -KeyboardLayout.totalWidth / 2
+        let relX = localX - leftEdge
+
+        if key.isBlack {
+            let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
+            let halfX = KeyboardLayout.blackKeyWidth / 2 + guidedKeyXTolerance
+            let halfZ = KeyboardLayout.blackKeyDepth / 2 + guidedKeyZTolerance
+            guard abs(relX - key.xCenter) <= halfX,
+                  abs(localZ - blackZCenter) <= halfZ
+            else { return nil }
+            return key
+        }
+
+        let halfX = KeyboardLayout.whiteKeyWidth / 2 + 0.006
+        let halfZ = KeyboardLayout.whiteKeyDepth / 2 + guidedKeyZTolerance
+        guard abs(relX - key.xCenter) <= halfX,
+              abs(localZ) <= halfZ
+        else { return nil }
+        return key
     }
 
     private func makeGuidedCandidate(key: KeyboardLayout.Key?,

@@ -44,10 +44,10 @@ final class AudioPitchDetector: ObservableObject {
     private let hop = 512
     private let log2n: vDSP_Length = 11
 
-    private let minRMS: Float = 0.0008
-    private let ambientRMSRatio: Float = 2.2
-    private let minFluxScore: Float = 0.16
-    private let ambientFluxRatio: Float = 2.6
+    private let minRMS: Float = 0.00065
+    private let ambientRMSRatio: Float = 2.0
+    private let minFluxScore: Float = 0.14
+    private let ambientFluxRatio: Float = 2.35
     private let minAttackInterval: TimeInterval = 0.13
     private let maxPitchHints = 3
 
@@ -250,9 +250,9 @@ final class AudioPitchDetector: ObservableObject {
         performFFT()
         computeSpectrumMagnitude()
 
-        let low = bandStats(fromHz: 30, toHz: 400, weight: 0.85)
-        let mid = bandStats(fromHz: 400, toHz: 2_000, weight: 1.05)
-        let high = bandStats(fromHz: 2_000, toHz: 7_500, weight: 1.55)
+        let low = bandStats(fromHz: 24, toHz: 360, weight: 0.95)
+        let mid = bandStats(fromHz: 360, toHz: 1_900, weight: 1.05)
+        let high = bandStats(fromHz: 1_900, toHz: 10_500, weight: 1.75)
         let onsetScore = low.flux + mid.flux + high.flux
         computeKeyEnergies()
         let attack = makeAttack(
@@ -368,7 +368,9 @@ final class AudioPitchDetector: ObservableObject {
         let hasHistory = hasPreviousSpectrum
         let enoughLevel = rms >= rmsGate
         let enoughChange = onsetScore >= fluxGate
-        let enoughTrebleOrMid = highScore >= fluxGate * 0.18 || midScore >= fluxGate * 0.25
+        let enoughTrebleOrMid = highScore >= fluxGate * 0.14
+            || midScore >= fluxGate * 0.22
+            || (lowScore >= fluxGate * 0.80 && rms >= rmsGate * 1.15)
         let cooledDown = timestamp - lastAttackTime >= minAttackInterval
 
         guard hasHistory, enoughLevel, enoughChange, enoughTrebleOrMid, cooledDown else {
