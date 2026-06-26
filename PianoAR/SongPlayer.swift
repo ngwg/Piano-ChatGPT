@@ -24,6 +24,7 @@ final class SongPlayer: ObservableObject {
     private(set) var acceptedCount: Int      = 0
     private(set) var mistakeCount:  Int      = 0
     private(set) var guidedMode:    Bool     = true
+    private(set) var acceptedGroupKeyIndices: Set<Int> = []
 
     // Pre-built lookup so the render thread never allocates.
     private(set) var midiToKeyIndex: [Int: Int] = [:]
@@ -44,6 +45,7 @@ final class SongPlayer: ObservableObject {
         expectedIndex = 0
         acceptedCount = 0
         mistakeCount  = 0
+        acceptedGroupKeyIndices.removeAll()
         feedbackLine  = "Ready: \(song.title ?? "Practice")"
     }
 
@@ -52,6 +54,7 @@ final class SongPlayer: ObservableObject {
         expectedIndex = 0
         acceptedCount = 0
         mistakeCount  = 0
+        acceptedGroupKeyIndices.removeAll()
         startHostTime = CACurrentMediaTime() + countInBeats * 60.0 / bpm
         isPlaying     = true
         feedbackLine  = nextPrompt(prefix: "Get ready")
@@ -67,13 +70,17 @@ final class SongPlayer: ObservableObject {
         play()
     }
 
-    func expectedKeyIndexNow() -> Int? {
+    func expectedKeyIndicesNow() -> Set<Int> {
         guard guidedMode,
               isPlaying,
-              expectedIndex < notes.count,
-              let midi = notes[expectedIndex].midiNote
-        else { return nil }
-        return midiToKeyIndex[midi]
+              expectedIndex < notes.count
+        else { return [] }
+
+        return Set(currentExpectedGroup().compactMap { item in item.keyIndex })
+    }
+
+    func expectedKeyIndexNow() -> Int? {
+        expectedKeyIndicesNow().sorted().first
     }
 
     func registerPress(keyIndex: Int, noteName: String) -> PracticePressResult {
@@ -81,9 +88,11 @@ final class SongPlayer: ObservableObject {
         guard guidedMode else {
             return .correct(expectedKeyIndex: keyIndex, noteName: noteName)
         }
-        guard expectedIndex < notes.count,
-              let expectedMidi = notes[expectedIndex].midiNote,
-              let expectedKeyIndex = midiToKeyIndex[expectedMidi]
+
+        let group = currentExpectedGroup()
+        let expectedKeyIndices = Set(group.compactMap { item in item.keyIndex })
+        guard !group.isEmpty,
+              !expectedKeyIndices.isEmpty
         else {
             DispatchQueue.main.async { [weak self] in
                 self?.isPlaying = false
@@ -92,8 +101,8 @@ final class SongPlayer: ObservableObject {
             return .ignored
         }
 
-        let expectedName = notes[expectedIndex].key
-        guard keyIndex == expectedKeyIndex else {
+        let expectedName = promptFor(group: group, excluding: acceptedGroupKeyIndices)
+        guard expectedKeyIndices.contains(keyIndex) else {
             mistakeCount += 1
             DispatchQueue.main.async { [weak self] in
                 self?.feedbackLine = "Try \(expectedName) again"
@@ -101,15 +110,26 @@ final class SongPlayer: ObservableObject {
             return .wrong(
                 playedKeyIndex: keyIndex,
                 playedName: noteName,
-                expectedKeyIndex: expectedKeyIndex,
+                expectedKeyIndex: expectedKeyIndices.sorted().first ?? keyIndex,
                 expectedName: expectedName
             )
         }
 
-        let acceptedBeat = notes[expectedIndex].startBeat
-        expectedIndex += 1
+        if acceptedGroupKeyIndices.contains(keyIndex) {
+            return .ignored
+        }
+
+        acceptedGroupKeyIndices.insert(keyIndex)
         acceptedCount += 1
-        startHostTime = CACurrentMediaTime() - acceptedBeat * 60.0 / bpm
+        let acceptedNoteName = group.first { item in item.keyIndex == keyIndex }?.note.key ?? noteName
+
+        let groupComplete = expectedKeyIndices.isSubset(of: acceptedGroupKeyIndices)
+        if groupComplete {
+            let acceptedBeat = notes[expectedIndex].startBeat
+            advanceExpectedGroup()
+            acceptedGroupKeyIndices.removeAll()
+            startHostTime = CACurrentMediaTime() - acceptedBeat * 60.0 / bpm
+        }
 
         if expectedIndex >= notes.count {
             DispatchQueue.main.async { [weak self] in
@@ -117,13 +137,19 @@ final class SongPlayer: ObservableObject {
                 self?.feedbackLine = "Complete: \(self?.acceptedCount ?? 0) notes"
             }
         } else {
-            let prompt = nextPrompt(prefix: "Good \(expectedName)")
+            let prompt: String
+            if groupComplete {
+                prompt = nextPrompt(prefix: "Good \(acceptedNoteName)")
+            } else {
+                let remaining = promptFor(group: group, excluding: acceptedGroupKeyIndices)
+                prompt = "Good \(acceptedNoteName): add \(remaining)"
+            }
             DispatchQueue.main.async { [weak self] in
                 self?.feedbackLine = prompt
             }
         }
 
-        return .correct(expectedKeyIndex: expectedKeyIndex, noteName: expectedName)
+        return .correct(expectedKeyIndex: keyIndex, noteName: acceptedNoteName)
     }
 
     // MARK: - Render-thread query (call from SCNSceneRenderer delegate)
@@ -145,6 +171,42 @@ final class SongPlayer: ObservableObject {
 
     private func nextPrompt(prefix: String) -> String {
         guard expectedIndex < notes.count else { return "\(prefix): done" }
-        return "\(prefix): \(notes[expectedIndex].key)"
+        return "\(prefix): \(promptFor(group: currentExpectedGroup()))"
+    }
+
+    private func currentGroupRange() -> Range<Int>? {
+        guard expectedIndex < notes.count else { return nil }
+        let startBeat = notes[expectedIndex].startBeat
+        var end = expectedIndex
+        while end < notes.count,
+              abs(notes[end].startBeat - startBeat) < 0.001 {
+            end += 1
+        }
+        return expectedIndex..<end
+    }
+
+    private func currentExpectedGroup() -> [(note: SongNote, keyIndex: Int?)] {
+        guard let range = currentGroupRange() else { return [] }
+        return range.map { idx in
+            let note = notes[idx]
+            let keyIndex = note.midiNote.flatMap { midiToKeyIndex[$0] }
+            return (note: note, keyIndex: keyIndex)
+        }
+    }
+
+    private func advanceExpectedGroup() {
+        guard let range = currentGroupRange() else { return }
+        expectedIndex = range.upperBound
+    }
+
+    private func promptFor(group: [(note: SongNote, keyIndex: Int?)],
+                           excluding accepted: Set<Int> = []) -> String {
+        let names = group.compactMap { item -> String? in
+            if let keyIndex = item.keyIndex, accepted.contains(keyIndex) {
+                return nil
+            }
+            return item.note.key
+        }
+        return names.isEmpty ? "done" : names.joined(separator: " + ")
     }
 }

@@ -63,14 +63,14 @@ final class PressDetector: ObservableObject {
                 keyboardNode: SCNNode?,
                 time: TimeInterval,
                 audioSnapshot: PitchSnapshot? = nil,
-                expectedKeyIndex: Int? = nil) -> [PressEvent] {
+                expectedKeyIndices: Set<Int> = []) -> [PressEvent] {
         guard let kb = keyboardNode else { return [] }
 
         var newPresses: [PressEvent] = []
         var seen = Set<String>()
         var debugLines: [String] = []
         var guidedCandidates: [FingerCandidate] = []
-        let guidedPractice = expectedKeyIndex != nil
+        let guidedPractice = !expectedKeyIndices.isEmpty
 
         for hand in hands {
             let side = hand.isLeft ? "L" : "R"
@@ -96,7 +96,7 @@ final class PressDetector: ObservableObject {
                 let guidedKey = expectedGuidedKey(
                     localX: local.x,
                     localZ: local.z,
-                    expectedKeyIndex: expectedKeyIndex
+                    expectedKeyIndices: expectedKeyIndices
                 ) ?? findKey(
                     localX: local.x,
                     localZ: local.z,
@@ -108,7 +108,7 @@ final class PressDetector: ObservableObject {
                         for: $0.index,
                         snapshot: audioSnapshot,
                         time: time,
-                        expectedKeyIndex: expectedKeyIndex
+                        expectedKeyIndices: expectedKeyIndices
                     )
                 } ?? 0
                 let surfaceY: Float = (key?.isBlack == true)
@@ -120,7 +120,7 @@ final class PressDetector: ObservableObject {
                     key: guidedKey,
                     fingerID: fid,
                     localY: local.y,
-                    expectedKeyIndex: expectedKeyIndex
+                    expectedKeyIndices: expectedKeyIndices
                 ) {
                     guidedCandidates.append(candidate)
                 }
@@ -193,14 +193,13 @@ final class PressDetector: ObservableObject {
             }
         }
 
-        if let guided = guidedPressEvent(
+        let guided = guidedPressEvents(
             from: guidedCandidates,
-            expectedKeyIndex: expectedKeyIndex,
+            expectedKeyIndices: expectedKeyIndices,
             snapshot: audioSnapshot,
             time: time
-        ) {
-            newPresses.append(guided)
-        }
+        )
+        newPresses.append(contentsOf: guided)
 
         // Clear fingers no longer tracked
         for fid in fingers.keys where !seen.contains(fid) {
@@ -275,38 +274,48 @@ final class PressDetector: ObservableObject {
 
     private func expectedGuidedKey(localX: Float,
                                    localZ: Float,
-                                   expectedKeyIndex: Int?) -> KeyboardLayout.Key? {
-        guard let expectedKeyIndex,
-              expectedKeyIndex >= 0,
-              expectedKeyIndex < KeyboardLayout.keys.count
-        else { return nil }
+                                   expectedKeyIndices: Set<Int>) -> KeyboardLayout.Key? {
+        guard !expectedKeyIndices.isEmpty else { return nil }
 
-        let key = KeyboardLayout.keys[expectedKeyIndex]
         let leftEdge = -KeyboardLayout.totalWidth / 2
         let relX = localX - leftEdge
+        var best: (key: KeyboardLayout.Key, score: Float)?
 
-        if key.isBlack {
-            let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
-            let halfX = KeyboardLayout.blackKeyWidth / 2 + guidedKeyXTolerance
-            let halfZ = KeyboardLayout.blackKeyDepth / 2 + guidedKeyZTolerance
-            guard abs(relX - key.xCenter) <= halfX,
-                  abs(localZ - blackZCenter) <= halfZ
-            else { return nil }
-            return key
+        for index in expectedKeyIndices.sorted() {
+            guard index >= 0, index < KeyboardLayout.keys.count else { continue }
+            let key = KeyboardLayout.keys[index]
+
+            if key.isBlack {
+                let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
+                let halfX = KeyboardLayout.blackKeyWidth / 2 + guidedKeyXTolerance
+                let halfZ = KeyboardLayout.blackKeyDepth / 2 + guidedKeyZTolerance
+                let dx = abs(relX - key.xCenter)
+                let dz = abs(localZ - blackZCenter)
+                guard dx <= halfX, dz <= halfZ else { continue }
+                let score = 1.0 - min(1.0, dx / halfX) * 0.70 - min(1.0, dz / halfZ) * 0.30
+                if best == nil || score > best!.score {
+                    best = (key, score)
+                }
+            } else {
+                let halfX = KeyboardLayout.whiteKeyWidth / 2 + 0.008
+                let halfZ = KeyboardLayout.whiteKeyDepth / 2 + guidedKeyZTolerance
+                let dx = abs(relX - key.xCenter)
+                let dz = abs(localZ)
+                guard dx <= halfX, dz <= halfZ else { continue }
+                let score = 1.0 - min(1.0, dx / halfX) * 0.78 - min(1.0, dz / halfZ) * 0.22
+                if best == nil || score > best!.score {
+                    best = (key, score)
+                }
+            }
         }
 
-        let halfX = KeyboardLayout.whiteKeyWidth / 2 + 0.006
-        let halfZ = KeyboardLayout.whiteKeyDepth / 2 + guidedKeyZTolerance
-        guard abs(relX - key.xCenter) <= halfX,
-              abs(localZ) <= halfZ
-        else { return nil }
-        return key
+        return best?.key
     }
 
     private func makeGuidedCandidate(key: KeyboardLayout.Key?,
                                      fingerID: String,
                                      localY: Float,
-                                     expectedKeyIndex: Int?) -> FingerCandidate? {
+                                     expectedKeyIndices: Set<Int>) -> FingerCandidate? {
         guard let key else { return nil }
         let surfaceY: Float = key.isBlack
             ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
@@ -316,7 +325,7 @@ final class PressDetector: ObservableObject {
 
         let hover = max(0, depth)
         let verticalScore = 1.0 - min(1.0, hover / guidedMaxHover)
-        let isExpected = expectedKeyIndex.map { $0 == key.index } ?? false
+        let isExpected = expectedKeyIndices.contains(key.index)
         let targetBonus: Float = isExpected ? 0.18 : 0
         return FingerCandidate(
             key: key,
@@ -325,54 +334,72 @@ final class PressDetector: ObservableObject {
         )
     }
 
-    private func guidedPressEvent(from candidates: [FingerCandidate],
-                                  expectedKeyIndex: Int?,
-                                  snapshot: PitchSnapshot?,
-                                  time: TimeInterval) -> PressEvent? {
-        guard let expectedKeyIndex,
+    private func guidedPressEvents(from candidates: [FingerCandidate],
+                                   expectedKeyIndices: Set<Int>,
+                                   snapshot: PitchSnapshot?,
+                                   time: TimeInterval) -> [PressEvent] {
+        guard !expectedKeyIndices.isEmpty,
               let snapshot,
               let attack = snapshot.attack,
               abs(time - attack.timestamp) <= guidedAttackWindow,
               attack.timestamp - lastGuidedAttackTime > 0.001
-        else { return nil }
+        else { return [] }
 
-        let expectedCandidate = candidates
-            .filter { $0.key.index == expectedKeyIndex }
-            .max { $0.score < $1.score }
-        let selected = expectedCandidate ?? candidates.max { $0.score < $1.score }
-        guard let selected else { return nil }
+        var selected: [FingerCandidate] = []
+        var usedFingers = Set<String>()
+        for keyIndex in expectedKeyIndices.sorted() {
+            let candidate = candidates
+                .filter { $0.key.index == keyIndex && !usedFingers.contains($0.fingerID) }
+                .max { $0.score < $1.score }
+            if let candidate {
+                selected.append(candidate)
+                usedFingers.insert(candidate.fingerID)
+            }
+        }
+
+        if selected.isEmpty,
+           let wrong = candidates
+                .filter({ !expectedKeyIndices.contains($0.key.index) })
+                .max(by: { $0.score < $1.score }) {
+            selected = [wrong]
+        }
+
+        guard !selected.isEmpty else { return [] }
 
         lastGuidedAttackTime = attack.timestamp
-        lastKeyPressTime[selected.key.index] = time
 
-        let pitchBonus: Float = snapshot.activeNotes.contains {
-            abs($0.keyIndex - selected.key.index) <= 1
-        } ? 0.08 : 0
-        let expectedBonus: Float = selected.key.index == expectedKeyIndex ? 0.12 : 0
-        let confidence = min(
-            1.0,
-            selected.score + attack.confidence * 0.20 + pitchBonus + expectedBonus
-        )
+        return selected.map { candidate in
+            lastKeyPressTime[candidate.key.index] = time
+            let pitchBonus: Float = snapshot.activeNotes.contains {
+                abs($0.keyIndex - candidate.key.index) <= 1
+            } ? 0.08 : 0
+            let expectedBonus: Float = expectedKeyIndices.contains(candidate.key.index) ? 0.12 : 0
+            let confidence = min(
+                1.0,
+                candidate.score + attack.confidence * 0.20 + pitchBonus + expectedBonus
+            )
 
-        return PressEvent(
-            keyIndex: selected.key.index,
-            noteName: selected.key.noteName,
-            confidence: confidence,
-            fingerID: selected.fingerID,
-            timestamp: time
-        )
+            return PressEvent(
+                keyIndex: candidate.key.index,
+                noteName: candidate.key.noteName,
+                confidence: confidence,
+                fingerID: candidate.fingerID,
+                timestamp: time
+            )
+        }
     }
 
     private func audioBoost(for keyIndex: Int,
                             snapshot: PitchSnapshot?,
                             time: TimeInterval,
-                            expectedKeyIndex: Int?) -> Float {
+                            expectedKeyIndices: Set<Int>) -> Float {
         guard let snapshot,
               let attack = snapshot.attack,
               abs(time - attack.timestamp) <= 0.12
         else { return 0 }
 
-        if let expectedKeyIndex, expectedKeyIndex != keyIndex {
+        if !expectedKeyIndices.isEmpty,
+           !expectedKeyIndices.contains(keyIndex) {
             return 0
         }
 

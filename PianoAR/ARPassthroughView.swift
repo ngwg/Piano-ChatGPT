@@ -95,14 +95,14 @@ struct ARPassthroughView: UIViewRepresentable {
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
             let audio = audioDetector.snapshot()
-            let expectedKeyIndex = songPlayer.expectedKeyIndexNow()
+            let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
             hand3D?.update(hands: hands)
 
             // Guided practice: key geometry decides identity; mic attack decides timing.
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
                 audioSnapshot: audio,
-                expectedKeyIndex: expectedKeyIndex
+                expectedKeyIndices: expectedKeyIndices
             )
             for p in presses {
                 switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName) {
