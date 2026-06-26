@@ -98,7 +98,7 @@ struct ARPassthroughView: UIViewRepresentable {
             let expectedKeyIndex = songPlayer.expectedKeyIndexNow()
             hand3D?.update(hands: hands)
 
-            // Press detection: fingertip depth vs. keyboard surface
+            // Guided practice: key geometry decides identity; mic attack decides timing.
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
                 audioSnapshot: audio,
