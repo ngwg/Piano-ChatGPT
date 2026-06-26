@@ -4,6 +4,8 @@ Head-mounted AR piano trainer for iPhone 16 Pro inserted into a Cardboard-style 
 
 ## Status
 
+Phase 5 completed with `/goal`: guided right-hand practice now uses vision/key geometry for note identity and mic attacks for timing.
+
 Phase 5 prototype:
 
 - ARKit passthrough with LiDAR-backed world tracking.
