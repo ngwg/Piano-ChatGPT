@@ -26,9 +26,6 @@ final class PressDetector: ObservableObject {
     private let guidedMaxBelow: Float = 0.045
     private let guidedKeyXTolerance: Float = 0.010
     private let guidedKeyZTolerance: Float = 0.030
-    private let guidedSoftPressVel: Float = -0.00035
-    private let guidedSoftPressHover: Float = 0.055
-    private let guidedSoftLockout: TimeInterval = 0.22
 
     // Per-finger tracking
     enum Phase: String { case idle, descending, pressed }
@@ -42,8 +39,6 @@ final class PressDetector: ObservableObject {
     private struct FingerCandidate {
         let key: KeyboardLayout.Key
         let fingerID: String
-        let depth: Float
-        let velocity: Float
         let score: Float
     }
 
@@ -124,6 +119,15 @@ final class PressDetector: ObservableObject {
                     : KeyboardLayout.whiteKeyHeight
                 let depth = local.y - surfaceY   // negative = below surface
 
+                if let candidate = makeGuidedCandidate(
+                    key: guidedKey,
+                    fingerID: fid,
+                    localY: local.y,
+                    expectedKeyIndices: expectedKeyIndices
+                ) {
+                    guidedCandidates.append(candidate)
+                }
+
                 // Smoothed velocity over 3 frames
                 let vel: Float
                 if track.yHistory.count >= 3 {
@@ -131,16 +135,6 @@ final class PressDetector: ObservableObject {
                     vel = (h[h.count - 1] - h[h.count - 3]) / 2.0
                 } else {
                     vel = 0
-                }
-
-                if let candidate = makeGuidedCandidate(
-                    key: guidedKey,
-                    fingerID: fid,
-                    localY: local.y,
-                    velocity: vel,
-                    expectedKeyIndices: expectedKeyIndices
-                ) {
-                    guidedCandidates.append(candidate)
                 }
 
                 // ── State machine ──────────────────────────────────────────
@@ -209,15 +203,6 @@ final class PressDetector: ObservableObject {
             time: time
         )
         newPresses.append(contentsOf: guided)
-
-        if guided.isEmpty {
-            let softGuided = guidedMotionPressEvents(
-                from: guidedCandidates,
-                expectedKeyIndices: expectedKeyIndices,
-                time: time
-            )
-            newPresses.append(contentsOf: softGuided)
-        }
 
         // Clear fingers no longer tracked
         for fid in fingers.keys where !seen.contains(fid) {
@@ -367,7 +352,6 @@ final class PressDetector: ObservableObject {
     private func makeGuidedCandidate(key: KeyboardLayout.Key?,
                                      fingerID: String,
                                      localY: Float,
-                                     velocity: Float,
                                      expectedKeyIndices: Set<Int>) -> FingerCandidate? {
         guard let key else { return nil }
         let surfaceY: Float = key.isBlack
@@ -383,8 +367,6 @@ final class PressDetector: ObservableObject {
         return FingerCandidate(
             key: key,
             fingerID: fingerID,
-            depth: depth,
-            velocity: velocity,
             score: 0.46 + verticalScore * 0.34 + targetBonus
         )
     }
@@ -442,51 +424,6 @@ final class PressDetector: ObservableObject {
                 timestamp: time
             )
         }
-    }
-
-    private func guidedMotionPressEvents(from candidates: [FingerCandidate],
-                                         expectedKeyIndices: Set<Int>,
-                                         time: TimeInterval) -> [PressEvent] {
-        guard !expectedKeyIndices.isEmpty else { return [] }
-
-        var selected: [FingerCandidate] = []
-        var usedFingers = Set<String>()
-
-        for keyIndex in expectedKeyIndices.sorted() {
-            let candidate = candidates
-                .filter {
-                    $0.key.index == keyIndex
-                        && !usedFingers.contains($0.fingerID)
-                        && time - lastKeyPressTime[$0.key.index] > guidedSoftLockout
-                        && isSoftPress($0)
-                }
-                .max { $0.score < $1.score }
-            if let candidate {
-                selected.append(candidate)
-                usedFingers.insert(candidate.fingerID)
-            }
-        }
-
-        return selected.map { candidate in
-            lastKeyPressTime[candidate.key.index] = time
-            let hover = Swift.max(Float(0), candidate.depth)
-            let closeness = Float(1.0) - Swift.min(Float(1.0), hover / guidedSoftPressHover)
-            let confidence = Swift.min(Float(0.92), Float(0.58) + closeness * 0.22 + candidate.score * 0.12)
-            return PressEvent(
-                keyIndex: candidate.key.index,
-                noteName: candidate.key.noteName,
-                confidence: confidence,
-                fingerID: candidate.fingerID,
-                timestamp: time
-            )
-        }
-    }
-
-    private func isSoftPress(_ candidate: FingerCandidate) -> Bool {
-        let closeEnough = candidate.depth < guidedSoftPressHover
-        let movingDown = candidate.velocity < guidedSoftPressVel
-        let belowSurface = candidate.depth < -0.004
-        return closeEnough && (movingDown || belowSurface)
     }
 
     private func audioBoost(for keyIndex: Int,

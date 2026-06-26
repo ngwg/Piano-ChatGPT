@@ -44,11 +44,11 @@ final class AudioPitchDetector: ObservableObject {
     private let hop = 512
     private let log2n: vDSP_Length = 11
 
-    private let minRMS: Float = 0.00055
+    private let minRMS: Float = 0.00065
     private let ambientRMSRatio: Float = 2.0
-    private let minFluxScore: Float = 0.12
-    private let ambientFluxRatio: Float = 2.20
-    private let minAttackInterval: TimeInterval = 0.10
+    private let minFluxScore: Float = 0.14
+    private let ambientFluxRatio: Float = 2.35
+    private let minAttackInterval: TimeInterval = 0.13
     private let maxPitchHints = 3
 
     private var binRes: Float = 48_000 / 2048
